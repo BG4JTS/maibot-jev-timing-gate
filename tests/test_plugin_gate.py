@@ -23,6 +23,7 @@
 
 import asyncio
 import importlib.util
+import json
 import os
 import shutil
 import socket
@@ -458,6 +459,81 @@ def test_config_get():
         shutil.rmtree(data_dir, ignore_errors=True)
 
 
+def test_key_paths():
+    print("\n[9] 密钥位置：data_dir 优先 + 旧路径兼容 + 一次性告警（todo 8）")
+    repo_key = os.path.join(REPO_ROOT, "jev_config.json")
+    data_dir = tempfile.mkdtemp(prefix="jev_gate_key_")
+    try:
+        # ---- 9a. 仅旧路径（插件源码目录）存在 → 取到 key + 一次性告警 ----
+        with open(repo_key, "w", encoding="utf-8") as fh:
+            json.dump({"api_key": "sk-legacy-001"}, fh)
+        inst, ctx = _build_instance(data_dir)
+        check("仅旧文件 → _private_key() 取到 key", inst._private_key(), "sk-legacy-001")
+        check("仅旧文件 → _legacy_key_warned 置位",
+              getattr(inst, "_legacy_key_warned", False), True)
+        warns = [e for e in ctx.logger.entries if e[0] == "warning"]
+        check("仅旧文件 → 恰好 1 条 warning", len(warns), 1)
+        check("仅旧文件 → warning 含新位置提示", "data/plugins" in warns[0][1][0], True)
+        check("仅旧文件 → warning 不含密钥本身", "sk-legacy-001" not in warns[0][1][0], True)
+
+        # ---- 9b. 二次调用 → 仍取到 key，无新增告警（一次性守卫） ----
+        ctx.logger.entries.clear()
+        check("二次调用 → 仍取到 key", inst._private_key(), "sk-legacy-001")
+        warns2 = [e for e in ctx.logger.entries if e[0] == "warning"]
+        check("二次调用 → 无新增 warning", len(warns2), 0)
+
+        # ---- 9c. 仅 data_dir 文件存在 → key + 零 legacy 告警 ----
+        ctx.logger.entries.clear()
+        os.remove(repo_key)
+        data_key = os.path.join(data_dir, "jev_config.json")
+        with open(data_key, "w", encoding="utf-8") as fh:
+            json.dump({"api_key": "sk-data-002"}, fh)
+        inst2, ctx2 = _build_instance(data_dir)
+        check("仅 data_dir → _private_key() 取到 key", inst2._private_key(), "sk-data-002")
+        warns3 = [e for e in ctx2.logger.entries if e[0] == "warning"]
+        check("仅 data_dir → 零 legacy warning", len(warns3), 0)
+
+        # ---- 9d. 两处都存在 → data_dir 值胜出 ----
+        with open(repo_key, "w", encoding="utf-8") as fh:
+            json.dump({"api_key": "sk-legacy-003"}, fh)
+        with open(data_key, "w", encoding="utf-8") as fh:
+            json.dump({"api_key": "sk-data-004"}, fh)
+        inst3, ctx3 = _build_instance(data_dir)
+        check("两处都在 → data_dir 值胜出", inst3._private_key(), "sk-data-004")
+        warns4 = [e for e in ctx3.logger.entries if e[0] == "warning"]
+        check("两处都在 → 零 legacy warning（data_dir 命中）", len(warns4), 0)
+
+        # ---- 9e. 都不存在 → ""，无异常无告警 ----
+        ctx3.logger.entries.clear()
+        os.remove(repo_key)
+        os.remove(data_key)
+        check("两处都无 → _private_key() 返回空串", inst3._private_key(), "")
+        warns5 = [e for e in ctx3.logger.entries if e[0] == "warning"]
+        check("两处都无 → 无 warning", len(warns5), 0)
+
+        # ---- 9f. ctx.paths.data_dir 访问抛异常 → ""，不崩溃 ----
+        class BadPaths:
+            @property
+            def data_dir(self):
+                raise RuntimeError("paths unavailable")
+
+        inst4, ctx4 = _build_instance(data_dir)
+        inst4.ctx.paths = BadPaths()
+        check("paths.data_dir 抛异常 → 返回空串", inst4._private_key(), "")
+        warns6 = [e for e in ctx4.logger.entries if e[0] == "warning"]
+        check("paths.data_dir 抛异常 → 无 warning", len(warns6), 0)
+
+        # ---- 9g. 畸形 JSON → ""，无异常 ----
+        with open(data_key, "w", encoding="utf-8") as fh:
+            fh.write("{not json")
+        inst5, ctx5 = _build_instance(data_dir)
+        check("畸形 JSON → 返回空串", inst5._private_key(), "")
+    finally:
+        if os.path.exists(repo_key):
+            os.remove(repo_key)
+        shutil.rmtree(data_dir, ignore_errors=True)
+
+
 def test_log_dump():
     print("\n[7] 行为保持证据：日志元组 dump（供评审对照改动前文案）")
     data_dir = tempfile.mkdtemp(prefix="jev_gate_dump_")
@@ -496,6 +572,7 @@ if __name__ == "__main__":
         test_stale_state()
         test_e2e()
         test_config_get()
+        test_key_paths()
         test_log_dump()
         print("\n通过 %d / 失败 %d" % (PASS, FAIL))
     finally:

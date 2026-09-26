@@ -112,15 +112,47 @@ class JevTimingGatePlugin(MaiBotPlugin):
             "mention_window_chars": int(gate.mention_window_chars or core.DEFAULT_MENTION_WINDOW_CHARS),
         }
 
-    def _private_key(self) -> str:
-        """从插件目录下的 jev_config.json 读 key（便于用 600 权限把密钥隔离在配置界面之外）。"""
+    def _read_key_file(self, path: str) -> str:
+        """从指定 jev_config.json 读 key；任何读/解析异常都返回空串（调用方按「未配置」处理）。"""
 
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), PRIVATE_KEY_FILE)
         try:
             with open(path, encoding="utf-8") as fh:
                 return str(json.load(fh).get("api_key") or "").strip()
         except Exception:
             return ""
+
+    def _preferred_key_path(self) -> str:
+        """解析首选密钥位置：ctx.paths.data_dir（宿主规范持久化目录）；ctx/paths 缺失不崩溃。"""
+
+        try:
+            return os.path.join(str(self.ctx.paths.data_dir), PRIVATE_KEY_FILE)
+        except Exception:
+            return ""
+
+    def _private_key(self) -> str:
+        """从 jev_config.json 读 key（便于用 600 权限把密钥隔离在配置界面之外）。
+
+        优先读宿主规范位置 ``ctx.paths.data_dir``（``data/plugins/<plugin_id>/``）；
+        旧插件源码目录下的同名文件仍兼容读取，命中旧路径时**一次性**告警提示迁移。
+        两处都读不到（或文件损坏）返回空串、绝不抛异常——调用方按「未配置」放行。
+        """
+
+        preferred = self._preferred_key_path()
+        if preferred:
+            key = self._read_key_file(preferred)
+            if key:
+                return key
+        legacy = os.path.join(os.path.dirname(os.path.abspath(__file__)), PRIVATE_KEY_FILE)
+        key = self._read_key_file(legacy)
+        if key and not getattr(self, "_legacy_key_warned", False):
+            self._legacy_key_warned = True
+            self.ctx.logger.warning(
+                "%s：已从旧位置（插件源码目录）读取 %s。宿主规范的新位置是 "
+                "data/plugins/<plugin_id>/ 下的同名文件，请把该文件迁移过去"
+                "（文档明确不再推荐旧式 plugins/<plugin>/data 目录）。",
+                LOG_TAG, PRIVATE_KEY_FILE,
+            )
+        return key
 
     # ------------------------------------------------------------------ 昵称（@豁免用）
     async def _resolve_aliases(self, configured: list[str]) -> tuple[list[str], str]:

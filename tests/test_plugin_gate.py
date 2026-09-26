@@ -204,6 +204,15 @@ MENTION_ITEM = {"item_type": "UserMessageItem", "parts": [
     {"type": "text", "text": "@小助手 在吗"},
 ]}
 
+
+def _chat_item(text):
+    """构造一条带指定文本的普通聊天 Item（与 CHAT_ITEM 同构，便于造不同 state）。"""
+
+    return {"item_type": "UserMessageItem", "parts": [
+        {"type": "text", "text": '<message user="甲">\n'},
+        {"type": "text", "text": text},
+    ]}
+
 # ---------------------------------------------------------------------------
 # 5. 用例
 # ---------------------------------------------------------------------------
@@ -351,6 +360,9 @@ def test_e2e():
         # ---- 6c. choice=continue → 纯 continue，无 modified_kwargs ----
         ctx.logger.entries.clear()
         calls.clear()
+        # 该 state 已被 6a 写入去重缓存：本场景要验证「每次都触网」的旧语义，
+        # 故经插件的惰性访问器契约重置缓存（_dedup_cache=None → 下次访问重建）
+        inst._dedup_cache = None
 
         async def fake_ask_continue(text, cfg, aliases):
             calls.append(("continue", text))
@@ -370,6 +382,7 @@ def test_e2e():
         # ---- 6d. no_reply 低置信 → 证据不足，纯 continue ----
         ctx.logger.entries.clear()
         calls.clear()
+        inst._dedup_cache = None  # 同上：6c 又把 CHAT_ITEM 写回了缓存
 
         async def fake_ask_weak(text, cfg, aliases):
             calls.append(("weak", text))
@@ -563,6 +576,179 @@ def test_log_dump():
         shutil.rmtree(data_dir, ignore_errors=True)
 
 
+def test_dedup_reuse():
+    print("\n[10] 每轮去重：同 state 仅 1 次 Jev 调用；不同 state 再调（todo 6）")
+    data_dir = tempfile.mkdtemp(prefix="jev_gate_dedup_")
+    try:
+        inst, ctx = _build_instance(data_dir)
+        calls = []
+
+        async def fake_ask_suppress(text, cfg, aliases):
+            calls.append(text)
+            return "no_reply", 0.90, {"no_reply": 0.95}
+
+        inst._ask_choice = fake_ask_suppress
+
+        # ---- 1. 同 state 两次 → 恰好 1 次调用，第二次复用 ----
+        kw1 = {"items": [CHAT_ITEM], "tool_definitions": [{"name": "tool_a"}]}
+        kw2 = {"items": [CHAT_ITEM], "tool_definitions": [{"name": "tool_a"}]}
+        out1 = asyncio.run(_run_maybe_gate(inst, kw1))
+        check("同 state 第 1 次：action=continue 且带 modified_kwargs", out1["action"], "continue")
+        check("同 state 第 1 次：modified_kwargs.items 长度 1",
+              len(out1["modified_kwargs"]["items"]), 1)
+        check("同 state 第 1 次：tool_definitions 清空",
+              out1["modified_kwargs"]["tool_definitions"], [])
+        print("    calls_before_second=%d" % len(calls))
+        out2 = asyncio.run(_run_maybe_gate(inst, kw2))
+        print("    calls_after_second=%d" % len(calls))
+        check("同 state 第 2 次：action=continue 且带 modified_kwargs", out2["action"], "continue")
+        check("同 state 第 2 次：modified_kwargs.items 长度 1",
+              len(out2["modified_kwargs"]["items"]), 1)
+        check("同 state 第 2 次：tool_definitions 清空",
+              out2["modified_kwargs"]["tool_definitions"], [])
+        check("同 state 两次 → _ask_choice 恰好调用 1 次", len(calls), 1)
+        infos = [e for e in ctx.logger.entries if e[0] == "info"]
+        reuse_lines = [a for a in infos if "复用本轮判定" in a[1][0]]
+        check("第 2 次日志含「复用本轮判定」", len(reuse_lines), 1)
+        breaker = inst._breaker()
+        check("复用路径不记录熔断失败（failure_count=0）", breaker.failure_count, 0)
+        check("复用路径熔断未打开（opened_at=None）", breaker.opened_at, None)
+
+        # ---- 2. 不同 state → 第 2 次调用发生 ----
+        ctx.logger.entries.clear()
+        out3 = asyncio.run(_run_maybe_gate(inst, {"items": [_chat_item("完全不同的另一句")]}))
+        check("不同 state → 返回 continue（新判定）", out3["action"], "continue")
+        check("不同 state → _ask_choice 计数 1→2", len(calls), 2)
+    finally:
+        shutil.rmtree(data_dir, ignore_errors=True)
+
+
+def test_breaker():
+    print("\n[11] 熔断：连续失败打开 → 阻塞不再调用 → 冷却到期关闭（todo 6）")
+    data_dir = tempfile.mkdtemp(prefix="jev_gate_breaker_")
+    try:
+        inst, ctx = _build_instance(data_dir)
+        calls = []
+        threshold = _plugin_mod.BREAKER_THRESHOLD
+
+        async def fake_ask_fail(text, cfg, aliases):
+            calls.append(text)
+            return None, None, {}
+
+        inst._ask_choice = fake_ask_fail
+
+        # ---- 3a. threshold-1 次失败：熔断仍未打开 ----
+        for i in range(threshold - 1):
+            out = asyncio.run(_run_maybe_gate(
+                inst, {"items": [_chat_item("失败状态%d" % i)]}))
+            check("第 %d 次失败 → 纯 continue（无改写）" % (i + 1),
+                  out["action"] == "continue" and out.get("modified_kwargs") is None, True)
+        check("threshold-1 次失败 → _ask_choice 调用 %d 次" % (threshold - 1),
+              len(calls), threshold - 1)
+        check("threshold-1 次失败 → 熔断仍关闭", inst._breaker().opened_at, None)
+
+        # ---- 3b. 第 threshold 次失败：熔断打开 ----
+        out = asyncio.run(_run_maybe_gate(inst, {"items": [_chat_item("失败状态开")]}))
+        check("第 %d 次失败 → 纯 continue" % threshold,
+              out["action"] == "continue" and out.get("modified_kwargs") is None, True)
+        check("第 %d 次失败 → _ask_choice 调用 %d 次" % (threshold, threshold),
+              len(calls), threshold)
+        check("第 %d 次失败 → 熔断打开" % threshold, inst._breaker().opened_at is not None, True)
+
+        # ---- 3c. 熔断打开后：不再调用，裸 continue，日志含「熔断」 ----
+        ctx.logger.entries.clear()
+        out = asyncio.run(_run_maybe_gate(inst, {"items": [_chat_item("熔断期内新状态")]}))
+        check("熔断打开 → 返回裸 continue（无 modified_kwargs）", out, {"action": "continue"})
+        check("熔断打开 → _ask_choice 未再调用（次数不变）", len(calls), threshold)
+        warns = [e for e in ctx.logger.entries if e[0] == "warning"]
+        breaker_warns = [a for a in warns if "熔断" in a[1][0]]
+        check("熔断打开 → 日志含「熔断」", len(breaker_warns), 1)
+
+        # ---- 4. 冷却到期（回拨 opened_at）→ 关闭并重新调用 ----
+        inst._breaker().opened_at -= (_plugin_mod.BREAKER_COOLDOWN_SECONDS + 1)
+        out = asyncio.run(_run_maybe_gate(inst, {"items": [_chat_item("冷却后新状态")]}))
+        check("冷却到期 → 熔断关闭", inst._breaker().opened_at, None)
+        check("冷却到期 → _ask_choice 再次调用（次数 +1）", len(calls), threshold + 1)
+    finally:
+        shutil.rmtree(data_dir, ignore_errors=True)
+
+
+def test_breaker_reset():
+    print("\n[12] 熔断：一次成功归零（连续失败语义，todo 6）")
+    data_dir = tempfile.mkdtemp(prefix="jev_gate_bres_")
+    try:
+        inst, ctx = _build_instance(data_dir)
+        calls = []
+        threshold = _plugin_mod.BREAKER_THRESHOLD
+        fail_result = (None, None, {})
+
+        async def fake_ask(text, cfg, aliases):
+            calls.append(text)
+            return fail_result
+
+        inst._ask_choice = fake_ask
+
+        for i in range(threshold - 1):
+            asyncio.run(_run_maybe_gate(inst, {"items": [_chat_item("前置失败%d" % i)]}))
+        check("threshold-1 次失败 → 熔断未打开", inst._breaker().opened_at, None)
+        check("threshold-1 次失败 → failure_count=%d" % (threshold - 1),
+              inst._breaker().failure_count, threshold - 1)
+
+        # 一次成功 → 计数归零
+        fail_result = ("no_reply", 0.90, {"no_reply": 0.95})
+        asyncio.run(_run_maybe_gate(inst, {"items": [_chat_item("成功状态")]}))
+        check("一次成功 → failure_count 归零", inst._breaker().failure_count, 0)
+        check("一次成功 → 熔断未打开", inst._breaker().opened_at, None)
+
+        # 再 threshold-1 次失败 → 仍关闭（连续失败，非累计）
+        fail_result = (None, None, {})
+        for i in range(threshold - 1):
+            asyncio.run(_run_maybe_gate(inst, {"items": [_chat_item("后置失败%d" % i)]}))
+        check("成功后再次 threshold-1 次失败 → failure_count=%d" % (threshold - 1),
+              inst._breaker().failure_count, threshold - 1)
+        check("成功后再次失败 → 熔断仍关闭（非累计）", inst._breaker().opened_at, None)
+        check("总调用次数=%d" % (2 * (threshold - 1) + 1),
+              len(calls), 2 * (threshold - 1) + 1)
+    finally:
+        shutil.rmtree(data_dir, ignore_errors=True)
+
+
+def test_dedup_ttl_expiry():
+    print("\n[13] 去重 TTL 过期：同 state 再次调用桩（todo 6）")
+    data_dir = tempfile.mkdtemp(prefix="jev_gate_ttl_")
+    try:
+        inst, ctx = _build_instance(data_dir)
+        calls = []
+
+        async def fake_ask(text, cfg, aliases):
+            calls.append(text)
+            return "no_reply", 0.90, {"no_reply": 0.95}
+
+        inst._ask_choice = fake_ask
+        item = _chat_item("TTL 测试句")
+        kwargs = {"items": [item]}
+
+        out1 = asyncio.run(_run_maybe_gate(inst, kwargs))
+        check("TTL 内：第 1 次返回 continue+modified_kwargs", out1["action"], "continue")
+        check("TTL 内：_ask_choice 调用 1 次", len(calls), 1)
+
+        # 证明 key 计算与插件一致：缓存里能取到该 state 的判定
+        cfg = inst._cfg()
+        state_text = core.extract_planner_state_text([item], max_chars=cfg["state_max_chars"])
+        key = core.turn_fingerprint(state_text)
+        check("缓存里存在该 state 的判定（key 与插件一致）",
+              inst._turn_dedup().get(key, 0.0) is not None, True)
+
+        # 用插件的访问器把该条目改成「早已过期」：now 注入到很久以前
+        inst._turn_dedup().put(key, {"choice": "no_reply"}, -1e9)
+
+        out2 = asyncio.run(_run_maybe_gate(inst, {"items": [item]}))
+        check("TTL 过期：同 state 再次调用 → continue+modified_kwargs", out2["action"], "continue")
+        check("TTL 过期：同 state 再次调用 → _ask_choice 计数 1→2", len(calls), 2)
+    finally:
+        shutil.rmtree(data_dir, ignore_errors=True)
+
+
 if __name__ == "__main__":
     try:
         test_finalize()
@@ -574,6 +760,10 @@ if __name__ == "__main__":
         test_config_get()
         test_key_paths()
         test_log_dump()
+        test_dedup_reuse()
+        test_breaker()
+        test_breaker_reset()
+        test_dedup_ttl_expiry()
         print("\n通过 %d / 失败 %d" % (PASS, FAIL))
     finally:
         urllib.request.urlopen = _orig_urlopen

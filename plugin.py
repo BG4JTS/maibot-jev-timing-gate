@@ -38,6 +38,10 @@ PRIVATE_KEY_FILE = "jev_config.json"
 HOOK_TIMEOUT_MS = 8000
 LOG_TAG = "Jev 门控"
 ALIAS_RETRY_SECONDS = 60.0
+DEDUP_CAPACITY = 256          # 去重缓存容量（有界 LRU）
+DEDUP_TTL_SECONDS = 120.0     # 同一内容指纹在此秒数内视为同一轮
+BREAKER_THRESHOLD = 5         # 连续失败达到此值 → 打开熔断
+BREAKER_COOLDOWN_SECONDS = 300.0  # 熔断打开后的冷却秒数
 
 
 class JevTimingGatePlugin(MaiBotPlugin):
@@ -233,6 +237,21 @@ class JevTimingGatePlugin(MaiBotPlugin):
             return None, None, {}
         return core.parse_response(cfg["api_style"], payload)
 
+    # ------------------------------------------------------------------ 去重 / 熔断状态（惰性：不依赖 on_load 已运行）
+    def _turn_dedup(self) -> core.DedupCache:
+        cache = getattr(self, "_dedup_cache", None)
+        if cache is None:
+            cache = core.DedupCache(capacity=DEDUP_CAPACITY, ttl_seconds=DEDUP_TTL_SECONDS)
+            self._dedup_cache = cache
+        return cache
+
+    def _breaker(self) -> core.BreakerState:
+        state = getattr(self, "_breaker_state", None)
+        if state is None:
+            state = core.BreakerState(threshold=BREAKER_THRESHOLD, cooldown_seconds=BREAKER_COOLDOWN_SECONDS)
+            self._breaker_state = state
+        return state
+
     # ------------------------------------------------------------------ 门控主体
     async def _maybe_gate(self, kwargs: dict[str, Any]) -> dict[str, Any]:
         cfg = self._cfg()
@@ -248,20 +267,39 @@ class JevTimingGatePlugin(MaiBotPlugin):
         items = kwargs.get("items")
         state_text = core.extract_planner_state_text(items, max_chars=cfg["state_max_chars"])
 
-        # ---- ① 纯决策接缝：给定已解析 cfg + state → 下一步动作（不 I/O）----
-        plan = core.plan_gate_action(cfg=cfg, state_text=state_text, aliases=aliases)
+        # ---- ① 纯决策接缝：给定已解析 cfg + state + 去重/熔断状态 → 下一步动作（不 I/O）----
+        now = asyncio.get_running_loop().time()
+        breaker = self._breaker()
+        breaker_open = core.breaker_should_skip(breaker, now)
+        dedup_key = core.turn_fingerprint(state_text)
+        cached = self._turn_dedup().get(dedup_key, now)
+        plan = core.plan_gate_action(
+            cfg=cfg, state_text=state_text, aliases=aliases,
+            cached_decision=cached, breaker_open=breaker_open,
+        )
         if plan["action"] == core.GATE_ACTION_CONTINUE:
             if plan["reason"] == "mentioned":
                 self.ctx.logger.info("%s：检测到 @机器人，跳过门控，正常进入 Planner", LOG_TAG)
-            # 其余 reason（disabled/gate_disabled/no_credentials/no_aliases/empty_state/
-            # breaker_open）与改动前一致：静默放行
+            elif plan["reason"] == "breaker_open":
+                remaining = 0.0
+                if breaker.opened_at is not None:
+                    remaining = max(0.0, breaker.opened_at + breaker.cooldown_seconds - now)
+                self.ctx.logger.warning(
+                    "%s：判定端点连续失败已熔断，冷却剩余 %.0f 秒，本轮跳过判定直接放行",
+                    LOG_TAG, remaining,
+                )
+            # 其余 reason（disabled/gate_disabled/no_credentials/no_aliases/empty_state）
+            # 与改动前一致：静默放行
             return {"action": "continue"}
         if plan["action"] == core.GATE_ACTION_REUSE:
-            # 复用上一轮判定（去重命中；todo 6 接入后可达）
+            # 复用上一轮判定（去重命中）：不再调用 Jev，也不记录熔断
             decision = dict(plan["decision"] or {})
+            self.ctx.logger.info("%s[复用]：复用本轮判定，不重复调用 Jev", LOG_TAG)
         else:
             # ---- ② Jev 判定 ----
             choice, confidence, probabilities = await self._ask_choice(state_text, cfg, aliases)
+            call_ok = choice is not None
+            core.breaker_record(breaker, call_ok, now)
             decision = core.evaluate_decision(
                 choice,
                 confidence,
@@ -270,6 +308,8 @@ class JevTimingGatePlugin(MaiBotPlugin):
                 confidence_fallback_threshold=cfg["confidence_fallback_threshold"],
             )
             decision = dict(decision, choice=choice)
+            if call_ok and decision.get("reason") != "no_result":
+                self._turn_dedup().put(dedup_key, dict(decision), now)
         conf_text, p_text = decision["conf_text"], decision["p_text"]
         original_items = len(items) if isinstance(items, list) else 0
         original_tools = len(kwargs.get("tool_definitions") or [])

@@ -33,6 +33,11 @@ _FRAMEWORK_TEXT_MARKERS: tuple[str, ...] = (
 
 _MESSAGE_TAG_RE = re.compile(r"<message\b")
 
+def _is_message_content(text: str) -> bool:
+    """判断 Item 文本是否为真实聊天消息（含 ``<message`` 标签）。"""
+
+    return _MESSAGE_TAG_RE.search(text) is not None
+
 def _is_framework_text(content: str) -> bool:
     """判断 Item 文本是否为框架注入（人设/群规/记忆/执行指令），而非聊天内容。
 
@@ -48,14 +53,22 @@ def _is_framework_text(content: str) -> bool:
 def extract_planner_state_text(items: Any, max_chars: int = 3000) -> str:
     """从 planner 请求 items 中提取**纯聊天内容**，作为 Jev 判定的 state。
 
-    只保留带 ``<message>`` 标签的聊天记录与普通消息片段；
-    剔除人设、群规、内部参考记忆、planner 执行指令等框架注入，
-    避免稀释信号。超长时取末尾（最新内容最相关）。
+    **Allowlist 优先，逐条 Item 判定**：
+      1. 先按 ``<message`` 标签判断这条 Item 是否为聊天消息；是 → **整条信任**
+         （该 Item 的全部文本 part 原样保留，即使命中框架排除标记也保留）；
+      2. 否则走**逐条回退**：只保留不命中 ``_FRAMEWORK_TEXT_MARKERS`` /
+         ``时间：`` 前缀的 part（沿用既有剔除行为）。
+
+    回退必须是**逐条**而非全局：``tests/test_gate_core.py:53`` 同时断言
+    ``"你好"``（``<message>`` 标记 Item 的 part）与 ``"最近一句聊天"``
+    （普通未标记 Item）都能存活——若改成全局规则（"存在任一 message 就只收
+    标记内容"），``"最近一句聊天"`` 会被丢弃，破坏该断言（计划禁止改测试）。
+    超长时取末尾（最新内容最相关），尾部截断行为不变。
     """
 
     if not isinstance(items, list):
         return ""
-    texts: list[str] = []
+    kept: list[str] = []
     for raw in items:
         if not isinstance(raw, dict):
             continue
@@ -64,18 +77,22 @@ def extract_planner_state_text(items: Any, max_chars: int = 3000) -> str:
         parts = raw.get("parts")
         if not isinstance(parts, list):
             continue
+        candidates: list[str] = []
         for part in parts:
             if not (isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str)):
                 continue
             cleaned = part["text"].strip()
             if not cleaned:
                 continue
-            if _is_framework_text(cleaned):
-                continue
-            texts.append(cleaned)
-    if not texts:
+            candidates.append(cleaned)
+        item_is_chat_message = any(_is_message_content(text) for text in candidates)
+        if item_is_chat_message:
+            kept.extend(candidates)
+        else:
+            kept.extend(text for text in candidates if not _is_framework_text(text))
+    if not kept:
         return ""
-    joined = "\n".join(texts)
+    joined = "\n".join(kept)
     if len(joined) > max_chars:
         joined = joined[-max_chars:]
     return joined

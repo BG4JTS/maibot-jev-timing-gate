@@ -1,0 +1,457 @@
+"""plugin.py 的离线集成测试（不需要 MaiBot SDK、不联网）。
+
+直接跑：python tests/test_plugin_gate.py
+
+两个关键技巧：
+1. **SDK 桩**：`maibot_sdk` 未安装，必须在 import 插件代码**之前**把桩塞进
+   `sys.modules`。桩的 `PluginConfigBase` 用**真实 pydantic**（``extra: allow``），
+   这样 `config.py` 不用改任何一行就能通过校验，`GateSettings(...)` 是真模型。
+2. **合成包**：仓库目录名 ``maibot-jev-timing-gate`` 含连字符，不是合法 Python
+   标识符，无法直接 ``import plugin``。这里用一个合成的包模块 ``jev_gate_pkg``
+   （``__path__ = [REPO_ROOT]``）把仓库根目录挂成包路径，再用
+   ``spec_from_file_location("jev_gate_pkg.plugin", ...)`` 加载 plugin.py，
+   使 plugin.py 内部的相对导入 ``from . import gate_core as core`` 与
+   ``from .config import GateSettings`` 都能正常解析（gate_core.py / config.py
+   会作为 ``jev_gate_pkg.gate_core`` / ``jev_gate_pkg.config`` 被自动导入）。
+
+网络护栏：全程替换联网入口——``urllib.request.urlopen``（插件唯一的网络面）、
+``socket.create_connection``（任何 HTTP 客户端建连入口）与 ``socket.getaddrinfo``
+（DNS 解析入口）——为抛 ``AssertionError`` 的函数：任何联网尝试都会立刻失败，
+而不是挂起。刻意**不**替换 ``socket.socket`` 本身：Windows 上 asyncio 的事件循环
+自建 self-pipe 需要 ``socket.socketpair()``，拦掉它会让测试根本起不了循环。
+"""
+
+import asyncio
+import importlib.util
+import os
+import shutil
+import socket
+import sys
+import tempfile
+import types
+import urllib.request
+
+import pydantic
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# ---------------------------------------------------------------------------
+# 1. 先把 maibot_sdk 桩塞进 sys.modules（必须在 import 插件代码之前）
+# ---------------------------------------------------------------------------
+
+_sdk = types.ModuleType("maibot_sdk")
+
+
+def _hook_handler(*args, **kwargs):
+    """HookHandler 桩：工厂，返回一个「原样返回函数」的装饰器。"""
+
+    def deco(fn):
+        return fn
+    return deco
+
+
+_sdk.HookHandler = _hook_handler
+
+
+class _MaiBotPlugin:
+    """MaiBotPlugin 桩：普通类即可（插件子类不需要 SDK 的元类/初始化）。"""
+
+
+_sdk.MaiBotPlugin = _MaiBotPlugin
+
+
+class _PluginConfigBase(pydantic.BaseModel):
+    """PluginConfigBase 桩：真实 pydantic 底座 + extra allow，config.py 原样可用。"""
+
+    model_config = {"extra": "allow"}
+
+
+_sdk.PluginConfigBase = _PluginConfigBase
+_sdk.Field = pydantic.Field
+
+_types = types.ModuleType("maibot_sdk.types")
+
+
+class _HookMode:
+    BLOCKING = "BLOCKING"
+
+
+class _HookOrder:
+    EARLY = "EARLY"
+
+
+_types.HookMode = _HookMode
+_types.HookOrder = _HookOrder
+
+_sdk.types = _types
+sys.modules["maibot_sdk"] = _sdk
+sys.modules["maibot_sdk.types"] = _types
+
+# ---------------------------------------------------------------------------
+# 2. 合成包：把仓库根挂成包路径，加载 plugin.py（含相对导入）
+# ---------------------------------------------------------------------------
+
+_pkg = types.ModuleType("jev_gate_pkg")
+_pkg.__path__ = [REPO_ROOT]
+sys.modules["jev_gate_pkg"] = _pkg
+
+_spec = importlib.util.spec_from_file_location(
+    "jev_gate_pkg.plugin", os.path.join(REPO_ROOT, "plugin.py"))
+_plugin_mod = importlib.util.module_from_spec(_spec)
+sys.modules["jev_gate_pkg.plugin"] = _plugin_mod
+_spec.loader.exec_module(_plugin_mod)
+
+core = _plugin_mod.core  # 插件实际使用的 gate_core 模块（同一对象）
+
+# ---------------------------------------------------------------------------
+# 3. 网络护栏：任何联网尝试（urlopen / 建连 / DNS）都立刻失败
+# ---------------------------------------------------------------------------
+
+_orig_urlopen = urllib.request.urlopen
+_orig_create_connection = socket.create_connection
+_orig_getaddrinfo = socket.getaddrinfo
+
+
+def _block_network(*args, **kwargs):
+    raise AssertionError("network access attempted")
+
+
+urllib.request.urlopen = _block_network
+socket.create_connection = _block_network
+socket.getaddrinfo = _block_network
+
+# ---------------------------------------------------------------------------
+# 4. 测试基础设施
+# ---------------------------------------------------------------------------
+
+PASS = FAIL = 0
+
+
+def check(name, got, want):
+    global PASS, FAIL
+    ok = got == want
+    PASS, FAIL = (PASS + 1, FAIL) if ok else (PASS, FAIL + 1)
+    print("  %s %-58s got=%s want=%s" % ("PASS" if ok else "FAIL", name, got, want))
+
+
+class FakeLogger:
+    """收集 (level, args) 元组的假 logger，供行为保持断言。"""
+
+    def __init__(self):
+        self.entries = []
+
+    def info(self, *args):
+        self.entries.append(("info", args))
+
+    def warning(self, *args):
+        self.entries.append(("warning", args))
+
+    def debug(self, *args):
+        self.entries.append(("debug", args))
+
+
+class FakeConfig:
+    """ctx.config 桩：async get，bot.nickname 返回「小助手」。"""
+
+    async def get(self, key, default=None):
+        if key == "bot.nickname":
+            return "小助手"
+        return default
+
+
+class FakePaths:
+    def __init__(self, data_dir):
+        self.data_dir = data_dir
+
+
+class FakeStatistics:
+    pass
+
+
+class FakeCtx:
+    def __init__(self, data_dir):
+        self.logger = FakeLogger()
+        self.paths = FakePaths(data_dir)
+        self.config = FakeConfig()
+        self.statistics = FakeStatistics()
+
+
+def _build_instance(data_dir):
+    """构造真实插件实例 + 假 ctx + 真 GateSettings 模型。"""
+
+    inst = _plugin_mod.JevTimingGatePlugin()
+    inst.ctx = FakeCtx(data_dir)
+    inst.config = _plugin_mod.GateSettings(
+        plugin={"enabled": True, "api_key": "test-key",
+                "endpoint": "https://example.invalid/v1/systemone"},
+        gate={"bot_aliases": ["小助手"]},
+    )
+    return inst, inst.ctx
+
+
+async def _run_maybe_gate(inst, kwargs):
+    return await inst._maybe_gate(kwargs)
+
+
+CHAT_ITEM = {"item_type": "UserMessageItem", "parts": [
+    {"type": "text", "text": '<message user="甲">\n'},
+    {"type": "text", "text": "最近一句聊天"},
+]}
+
+MENTION_ITEM = {"item_type": "UserMessageItem", "parts": [
+    {"type": "text", "text": '<message user="甲">\n'},
+    {"type": "text", "text": "@小助手 在吗"},
+]}
+
+# ---------------------------------------------------------------------------
+# 5. 用例
+# ---------------------------------------------------------------------------
+
+
+def test_finalize():
+    print("\n[1] finalize_gate_decision（五个分支）")
+    check("no_result → continue/no_result",
+          core.finalize_gate_decision({"reason": "no_result", "suppress": False}, shadow_mode=False),
+          {"action": "continue", "reason": "no_result"})
+    check("not_no_reply → continue/not_no_reply",
+          core.finalize_gate_decision({"reason": "not_no_reply", "suppress": False}, shadow_mode=False),
+          {"action": "continue", "reason": "not_no_reply"})
+    check("suppress=False → continue/insufficient_evidence",
+          core.finalize_gate_decision({"reason": "insufficient_evidence", "suppress": False}, shadow_mode=False),
+          {"action": "continue", "reason": "insufficient_evidence"})
+    check("suppress=True + 影子 → continue/shadow",
+          core.finalize_gate_decision({"reason": "", "suppress": True}, shadow_mode=True),
+          {"action": "continue", "reason": "shadow"})
+    check("suppress=True 非影子 → suppress/suppress",
+          core.finalize_gate_decision({"reason": "", "suppress": True}, shadow_mode=False),
+          {"action": "suppress", "reason": "suppress"})
+
+
+def test_plan():
+    print("\n[2] plan_gate_action（九个分支）")
+    base = {"enabled": True, "gate_enabled": True, "api_key": "k", "endpoint": "e",
+            "mention_window_chars": 600}
+    check("1. 未启用 → continue/disabled",
+          core.plan_gate_action(cfg=dict(base, enabled=False), state_text="x", aliases=["小助手"]),
+          {"action": "continue", "reason": "disabled", "decision": None})
+    check("2. gate 未启用 → continue/gate_disabled",
+          core.plan_gate_action(cfg=dict(base, gate_enabled=False), state_text="x", aliases=["小助手"]),
+          {"action": "continue", "reason": "gate_disabled", "decision": None})
+    check("3a. 缺 api_key → continue/no_credentials",
+          core.plan_gate_action(cfg=dict(base, api_key=""), state_text="x", aliases=["小助手"]),
+          {"action": "continue", "reason": "no_credentials", "decision": None})
+    check("3b. 缺 endpoint → continue/no_credentials",
+          core.plan_gate_action(cfg=dict(base, endpoint=""), state_text="x", aliases=["小助手"]),
+          {"action": "continue", "reason": "no_credentials", "decision": None})
+    check("4. 无别名 → continue/no_aliases",
+          core.plan_gate_action(cfg=base, state_text="x", aliases=[]),
+          {"action": "continue", "reason": "no_aliases", "decision": None})
+    check("5. 空 state → continue/empty_state",
+          core.plan_gate_action(cfg=base, state_text="", aliases=["小助手"]),
+          {"action": "continue", "reason": "empty_state", "decision": None})
+    check("6. @机器人 → continue/mentioned",
+          core.plan_gate_action(cfg=base, state_text="最后一句 @小助手 在吗", aliases=["小助手"]),
+          {"action": "continue", "reason": "mentioned", "decision": None})
+    check("7. 熔断打开 → continue/breaker_open",
+          core.plan_gate_action(cfg=base, state_text="x", aliases=["小助手"], breaker_open=True),
+          {"action": "continue", "reason": "breaker_open", "decision": None})
+    check("8. 命中去重缓存 → reuse/dedup_hit（decision 透传）",
+          core.plan_gate_action(cfg=base, state_text="x", aliases=["小助手"],
+                                cached_decision={"choice": "no_reply", "suppress": True}),
+          {"action": "reuse", "reason": "dedup_hit", "decision": {"choice": "no_reply", "suppress": True}})
+    check("9. 皆否 → call/call",
+          core.plan_gate_action(cfg=base, state_text="x", aliases=["小助手"]),
+          {"action": "call", "reason": "call", "decision": None})
+
+
+def test_malformed():
+    print("\n[3] 畸形输入（缺 mention_window_chars / 空 aliases / 空 state）")
+    partial = {"enabled": True, "gate_enabled": True, "api_key": "k", "endpoint": "e"}
+    try:
+        r = core.plan_gate_action(cfg=partial, state_text="x", aliases=["小助手"])
+        check("缺 mention_window_chars → 不抛异常，走 call", r["action"], "call")
+    except Exception as exc:
+        check("缺 mention_window_chars → 不抛异常（实际抛了 %s）" % repr(exc), "NO_EXC", "NO_EXC")
+    check("空 aliases → no_aliases 干净返回",
+          core.plan_gate_action(cfg=partial, state_text="x", aliases=[])["reason"], "no_aliases")
+    check("空 state → empty_state 干净返回",
+          core.plan_gate_action(cfg=partial, state_text="", aliases=["小助手"])["reason"], "empty_state")
+    check("cfg 全空 → disabled（无键也干净返回）",
+          core.plan_gate_action(cfg={}, state_text="", aliases=[])["reason"], "disabled")
+
+
+def test_static():
+    print("\n[4] 静态约束（gate_core 不依赖 SDK）")
+    src = open(os.path.join(REPO_ROOT, "gate_core.py"), encoding="utf-8").read()
+    check("gate_core.py 源码不含 'maibot_sdk'", "maibot_sdk" not in src, True)
+    check("插件实际使用的 core 模块就是仓库 gate_core.py",
+          os.path.abspath(core.__file__) == os.path.join(REPO_ROOT, "gate_core.py"), True)
+    check("DedupCache 可从接缝模块导入（无 SDK）",
+          callable(getattr(core, "DedupCache", None)), True)
+    check("BreakerState 可从接缝模块导入（无 SDK）",
+          callable(getattr(core, "BreakerState", None)), True)
+
+
+def test_stale_state():
+    print("\n[5] 去重 TTL / 熔断冷却（时钟注入，无墙钟依赖）")
+    cache = core.DedupCache(capacity=8, ttl_seconds=100.0)
+    cache.put("fp", {"choice": "no_reply"}, 0.0)
+    check("TTL 内命中（t=99）", cache.get("fp", 99.0)["choice"], "no_reply")
+    check("TTL 到期（t=100）→ 未命中", cache.get("fp", 100.0), None)
+
+    s = core.BreakerState()
+    for i in range(5):
+        core.breaker_record(s, False, float(i))
+    check("5 连败 → 熔断打开", core.breaker_should_skip(s, 5.0), True)
+    check("冷却期内（t=100）→ 跳过", core.breaker_should_skip(s, 100.0), True)
+    check("冷却到期（t=305）→ 关闭并放行", core.breaker_should_skip(s, 305.0), False)
+    check("关闭后 opened_at 复位", s.opened_at, None)
+
+
+def test_e2e():
+    print("\n[6] 端到端 _maybe_gate（真实插件实例 + 计数桩 _ask_choice）")
+    data_dir = tempfile.mkdtemp(prefix="jev_gate_e2e_")
+    try:
+        inst, ctx = _build_instance(data_dir)
+
+        # ---- 6a. 抑制场景：no_reply + 高概率 → 改写请求，恰好调用 1 次 ----
+        calls = []
+
+        async def fake_ask_suppress(text, cfg, aliases):
+            calls.append(("suppress", text))
+            return "no_reply", 0.90, {"no_reply": 0.95}
+
+        inst._ask_choice = fake_ask_suppress
+        kwargs = {"items": [CHAT_ITEM], "tool_definitions": [{"name": "tool_a"}]}
+        out = asyncio.run(_run_maybe_gate(inst, kwargs))
+        check("抑制：action=continue 且带 modified_kwargs", out["action"], "continue")
+        check("抑制：modified_kwargs.items 长度 1",
+              len(out["modified_kwargs"]["items"]), 1)
+        check("抑制：tool_definitions 清空",
+              out["modified_kwargs"]["tool_definitions"], [])
+        check("抑制：_ask_choice 恰好调用 1 次", len(calls), 1)
+        warns = [e for e in ctx.logger.entries if e[0] == "warning"]
+        check("抑制：记录 1 条 warning", len(warns), 1)
+        check("抑制：warning 文案与改动前一致（判定无需参与）",
+              "判定无需参与" in warns[0][1][0], True)
+
+        # ---- 6b. @机器人 场景：不调用 Jev，纯 continue ----
+        ctx.logger.entries.clear()
+        calls.clear()
+        kwargs2 = {"items": [MENTION_ITEM]}
+        out2 = asyncio.run(_run_maybe_gate(inst, kwargs2))
+        check("@机器人：返回纯 continue", out2, {"action": "continue"})
+        check("@机器人：_ask_choice 调用 0 次（必须不被调用）", len(calls), 0)
+        infos = [e for e in ctx.logger.entries if e[0] == "info"]
+        check("@机器人：记录 1 条 info", len(infos), 1)
+        check("@机器人：info 文案与改动前一致",
+              infos[0][1][0], "%s：检测到 @机器人，跳过门控，正常进入 Planner")
+
+        # ---- 6c. choice=continue → 纯 continue，无 modified_kwargs ----
+        ctx.logger.entries.clear()
+        calls.clear()
+
+        async def fake_ask_continue(text, cfg, aliases):
+            calls.append(("continue", text))
+            return "continue", 0.95, {"no_reply": 0.05}
+
+        inst._ask_choice = fake_ask_continue
+        kwargs3 = {"items": [CHAT_ITEM]}
+        out3 = asyncio.run(_run_maybe_gate(inst, kwargs3))
+        check("choice=continue → 纯 continue（无 modified_kwargs）",
+              out3["action"] == "continue" and out3.get("modified_kwargs") is None, True)
+        check("choice=continue：_ask_choice 调用 1 次", len(calls), 1)
+        not_no_reply = [e for e in ctx.logger.entries if e[0] == "info" and "conf=" in e[1][0]]
+        check("choice=continue：记录 not_no_reply info 行", len(not_no_reply), 1)
+        check("choice=continue：文案与改动前一致",
+              not_no_reply[0][1][0], "%s：%s (conf=%s p_no_reply=%s)，正常进入 Planner")
+
+        # ---- 6d. no_reply 低置信 → 证据不足，纯 continue ----
+        ctx.logger.entries.clear()
+        calls.clear()
+
+        async def fake_ask_weak(text, cfg, aliases):
+            calls.append(("weak", text))
+            return "no_reply", 0.50, {"no_reply": 0.55}
+
+        inst._ask_choice = fake_ask_weak
+        out4 = asyncio.run(_run_maybe_gate(inst, kwargs3))
+        check("no_reply 低置信 → 纯 continue（证据不足）",
+              out4["action"] == "continue" and out4.get("modified_kwargs") is None, True)
+        weak = [e for e in ctx.logger.entries if e[0] == "info" and "证据不足" in e[1][0]]
+        check("no_reply 低置信：记录证据不足 info 行", len(weak), 1)
+        check("no_reply 低置信：文案与改动前一致",
+              weak[0][1][0],
+              "%s：no_reply 但证据不足 (%s=%.2f < %.2f; conf=%s p_no_reply=%s)，正常进入 Planner")
+
+        # ---- 6e. 影子模式：本该抑制但不改写 ----
+        inst2, ctx2 = _build_instance(data_dir)
+        inst2.config = _plugin_mod.GateSettings(
+            plugin={"enabled": True, "api_key": "test-key",
+                    "endpoint": "https://example.invalid/v1/systemone", "shadow_mode": True},
+            gate={"bot_aliases": ["小助手"]},
+        )
+        calls2 = []
+
+        async def fake_ask2(text, cfg, aliases):
+            calls2.append(text)
+            return "no_reply", 0.90, {"no_reply": 0.95}
+
+        inst2._ask_choice = fake_ask2
+        out5 = asyncio.run(_run_maybe_gate(inst2, kwargs3))
+        check("影子：返回纯 continue，不改写", out5, {"action": "continue"})
+        check("影子：_ask_choice 调用 1 次", len(calls2), 1)
+        shadow = [e for e in ctx2.logger.entries if e[0] == "info" and "影子" in e[1][0]]
+        check("影子：记录 [影子] info 行", len(shadow), 1)
+        check("影子：文案与改动前一致",
+              shadow[0][1][0],
+              "%s[影子]：本该抑制（%s=%.2f >= %.2f; conf=%s）items=%s→1 tools=%s→0，本轮不改行为")
+    finally:
+        shutil.rmtree(data_dir, ignore_errors=True)
+
+
+def test_log_dump():
+    print("\n[7] 行为保持证据：日志元组 dump（供评审对照改动前文案）")
+    data_dir = tempfile.mkdtemp(prefix="jev_gate_dump_")
+    try:
+        inst, ctx = _build_instance(data_dir)
+
+        async def fake_ask(text, cfg, aliases):
+            return "no_reply", 0.90, {"no_reply": 0.95}
+
+        inst._ask_choice = fake_ask
+
+        # 抑制轮（cached-suppress 语义：判定进入抑制分支）
+        kwargs = {"items": [CHAT_ITEM], "tool_definitions": [{"name": "tool_a"}]}
+        asyncio.run(_run_maybe_gate(inst, kwargs))
+        for level, args in ctx.logger.entries:
+            print("  LOGTUPLE suppress %s %r" % (level, args))
+
+        # @机器人轮（mentioned：确定性豁免）
+        ctx.logger.entries.clear()
+        kwargs2 = {"items": [MENTION_ITEM]}
+        asyncio.run(_run_maybe_gate(inst, kwargs2))
+        for level, args in ctx.logger.entries:
+            print("  LOGTUPLE mentioned %s %r" % (level, args))
+
+        check("dump：日志元组已输出（无墙钟/uuid 依赖）", True, True)
+    finally:
+        shutil.rmtree(data_dir, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    try:
+        test_finalize()
+        test_plan()
+        test_malformed()
+        test_static()
+        test_stale_state()
+        test_e2e()
+        test_log_dump()
+        print("\n通过 %d / 失败 %d" % (PASS, FAIL))
+    finally:
+        urllib.request.urlopen = _orig_urlopen
+        socket.create_connection = _orig_create_connection
+        socket.getaddrinfo = _orig_getaddrinfo
+    sys.exit(1 if FAIL else 0)
+

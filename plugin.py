@@ -216,51 +216,56 @@ class JevTimingGatePlugin(MaiBotPlugin):
 
         items = kwargs.get("items")
         state_text = core.extract_planner_state_text(items, max_chars=cfg["state_max_chars"])
-        if not state_text:
-            return {"action": "continue"}
 
-        # ---- ① 确定性豁免：只在最新消息（尾部窗口）里找 @机器人 ----
-        if core.is_bot_addressed(state_text, aliases, cfg["mention_window_chars"]):
-            self.ctx.logger.info("%s：检测到 @机器人，跳过门控，正常进入 Planner", LOG_TAG)
+        # ---- ① 纯决策接缝：给定已解析 cfg + state → 下一步动作（不 I/O）----
+        plan = core.plan_gate_action(cfg=cfg, state_text=state_text, aliases=aliases)
+        if plan["action"] == core.GATE_ACTION_CONTINUE:
+            if plan["reason"] == "mentioned":
+                self.ctx.logger.info("%s：检测到 @机器人，跳过门控，正常进入 Planner", LOG_TAG)
+            # 其余 reason（disabled/gate_disabled/no_credentials/no_aliases/empty_state/
+            # breaker_open）与改动前一致：静默放行
             return {"action": "continue"}
-
-        # ---- ② Jev 判定 ----
-        choice, confidence, probabilities = await self._ask_choice(state_text, cfg, aliases)
-        decision = core.evaluate_decision(
-            choice,
-            confidence,
-            probabilities,
-            probability_threshold=cfg["probability_threshold"],
-            confidence_fallback_threshold=cfg["confidence_fallback_threshold"],
-        )
+        if plan["action"] == core.GATE_ACTION_REUSE:
+            # 复用上一轮判定（去重命中；todo 6 接入后可达）
+            decision = dict(plan["decision"] or {})
+        else:
+            # ---- ② Jev 判定 ----
+            choice, confidence, probabilities = await self._ask_choice(state_text, cfg, aliases)
+            decision = core.evaluate_decision(
+                choice,
+                confidence,
+                probabilities,
+                probability_threshold=cfg["probability_threshold"],
+                confidence_fallback_threshold=cfg["confidence_fallback_threshold"],
+            )
+            decision = dict(decision, choice=choice)
         conf_text, p_text = decision["conf_text"], decision["p_text"]
-
-        if decision["reason"] == "no_result":
-            return {"action": "continue"}
-        if decision["reason"] == "not_no_reply":
-            self.ctx.logger.info(
-                "%s：%s (conf=%s p_no_reply=%s)，正常进入 Planner",
-                LOG_TAG, choice, conf_text, p_text,
-            )
-            return {"action": "continue"}
-        if not decision["suppress"]:
-            self.ctx.logger.info(
-                "%s：no_reply 但证据不足 (%s=%.2f < %.2f; conf=%s p_no_reply=%s)，正常进入 Planner",
-                LOG_TAG, decision["evidence"], decision["value"], decision["limit"], conf_text, p_text,
-            )
-            return {"action": "continue"}
-
-        # ---- ③ 抑制 ----
         original_items = len(items) if isinstance(items, list) else 0
         original_tools = len(kwargs.get("tool_definitions") or [])
-        if cfg.get("shadow_mode"):
-            self.ctx.logger.info(
-                "%s[影子]：本该抑制（%s=%.2f >= %.2f; conf=%s）items=%s→1 tools=%s→0，本轮不改行为",
-                LOG_TAG, decision["evidence"], decision["value"], decision["limit"],
-                conf_text, original_items, original_tools,
-            )
+
+        # ---- ③ 收尾判定：继续 或 抑制 ----
+        outcome = core.finalize_gate_decision(decision, shadow_mode=bool(cfg.get("shadow_mode")))
+        if outcome["action"] == core.GATE_ACTION_CONTINUE:
+            if outcome["reason"] == "not_no_reply":
+                self.ctx.logger.info(
+                    "%s：%s (conf=%s p_no_reply=%s)，正常进入 Planner",
+                    LOG_TAG, decision.get("choice"), conf_text, p_text,
+                )
+            elif outcome["reason"] == "insufficient_evidence":
+                self.ctx.logger.info(
+                    "%s：no_reply 但证据不足 (%s=%.2f < %.2f; conf=%s p_no_reply=%s)，正常进入 Planner",
+                    LOG_TAG, decision["evidence"], decision["value"], decision["limit"], conf_text, p_text,
+                )
+            elif outcome["reason"] == "shadow":
+                self.ctx.logger.info(
+                    "%s[影子]：本该抑制（%s=%.2f >= %.2f; conf=%s）items=%s→1 tools=%s→0，本轮不改行为",
+                    LOG_TAG, decision["evidence"], decision["value"], decision["limit"],
+                    conf_text, original_items, original_tools,
+                )
+            # no_result 与其它 reason：保持静默，与改动前一致
             return {"action": "continue"}
 
+        # ---- ④ 抑制：改写本轮请求 ----
         kwargs["items"] = [core.build_gate_skip_item()]
         if "tool_definitions" in kwargs:
             kwargs["tool_definitions"] = []

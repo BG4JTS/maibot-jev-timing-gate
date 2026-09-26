@@ -23,7 +23,7 @@ import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 # ---------------------------------------------------------------------------
 # 1. planner 状态文本提取
@@ -605,3 +605,80 @@ def breaker_record(state: BreakerState, ok: bool, now: float) -> None:
     state.failure_count += 1
     if state.failure_count >= state.threshold and state.opened_at is None:
         state.opened_at = now
+
+
+# ---------------------------------------------------------------------------
+# 9. 门控动作决策（纯函数接缝：给定已解析 cfg + state + 去重/熔断状态 → 动作）
+# ---------------------------------------------------------------------------
+
+#: plan_gate_action() 的动作取值
+GATE_ACTION_CONTINUE = "continue"   # 直接放行，且不调用 Jev
+GATE_ACTION_REUSE = "reuse"         # 复用上一轮判定，不调用 Jev
+GATE_ACTION_CALL = "call"           # 需要调用 Jev 判定
+
+
+def plan_gate_action(*, cfg: Mapping[str, Any], state_text: str, aliases: Sequence[str],
+                     cached_decision: Mapping[str, Any] | None = None,
+                     breaker_open: bool = False) -> dict[str, Any]:
+    """纯决策：给定**已解析好**的 cfg / state_text / aliases 与去重、熔断状态，
+    决定 `_maybe_gate` 下一步做什么。**不做任何 I/O、不解析配置、不 import SDK。**
+
+    检查顺序与 `_maybe_gate` 原有顺序逐条对应，第一个命中的即为最终结论：
+      1. not cfg.get("enabled")                          → continue / disabled
+      2. not cfg.get("gate_enabled")                     → continue / gate_disabled
+      3. 缺 cfg.get("api_key") 或 cfg.get("endpoint")     → continue / no_credentials
+      4. not aliases                                     → continue / no_aliases
+      5. not state_text                                  → continue / empty_state
+      6. is_bot_addressed(state_text, aliases, cfg["mention_window_chars"])
+                                                         → continue / mentioned
+      7. breaker_open                                    → continue / breaker_open
+      8. cached_decision is not None                     → reuse / dedup_hit
+      9. 以上皆否                                        → call / call
+
+    Returns:
+        dict: ``{"action": <GATE_ACTION_*>, "reason": str, "decision": dict | None}``。
+        ``decision`` 仅在 ``reuse`` 时非 None，即上一轮存下的 ``evaluate_decision`` 结果。
+    """
+
+    if not cfg.get("enabled"):
+        return {"action": GATE_ACTION_CONTINUE, "reason": "disabled", "decision": None}
+    if not cfg.get("gate_enabled"):
+        return {"action": GATE_ACTION_CONTINUE, "reason": "gate_disabled", "decision": None}
+    if not cfg.get("api_key") or not cfg.get("endpoint"):
+        return {"action": GATE_ACTION_CONTINUE, "reason": "no_credentials", "decision": None}
+    if not aliases:
+        return {"action": GATE_ACTION_CONTINUE, "reason": "no_aliases", "decision": None}
+    if not state_text:
+        return {"action": GATE_ACTION_CONTINUE, "reason": "empty_state", "decision": None}
+    if is_bot_addressed(state_text, aliases, cfg.get("mention_window_chars", DEFAULT_MENTION_WINDOW_CHARS)):
+        return {"action": GATE_ACTION_CONTINUE, "reason": "mentioned", "decision": None}
+    if breaker_open:
+        return {"action": GATE_ACTION_CONTINUE, "reason": "breaker_open", "decision": None}
+    if cached_decision is not None:
+        return {"action": GATE_ACTION_REUSE, "reason": "dedup_hit", "decision": dict(cached_decision)}
+    return {"action": GATE_ACTION_CALL, "reason": "call", "decision": None}
+
+
+def finalize_gate_decision(decision: Mapping[str, Any], *, shadow_mode: bool) -> dict[str, Any]:
+    """纯决策：把 `evaluate_decision()` 的结果映射成一个动作，**不做任何 I/O**。
+
+      · decision["reason"] == "no_result"        → continue / no_result          （调用方保持静默）
+      · decision["reason"] == "not_no_reply"     → continue / not_no_reply
+      · decision["suppress"] 为假                → continue / insufficient_evidence
+      · suppress 为真 且 shadow_mode 为真         → continue / shadow
+      · 其余                                     → suppress / suppress
+
+    Returns:
+        dict: ``{"action": "continue" | "suppress", "reason": str}``。
+    """
+
+    reason = decision.get("reason")
+    if reason == "no_result":
+        return {"action": GATE_ACTION_CONTINUE, "reason": "no_result"}
+    if reason == "not_no_reply":
+        return {"action": GATE_ACTION_CONTINUE, "reason": "not_no_reply"}
+    if not decision.get("suppress"):
+        return {"action": GATE_ACTION_CONTINUE, "reason": "insufficient_evidence"}
+    if shadow_mode:
+        return {"action": GATE_ACTION_CONTINUE, "reason": "shadow"}
+    return {"action": "suppress", "reason": "suppress"}

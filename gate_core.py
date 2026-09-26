@@ -715,3 +715,109 @@ def build_decision_record(decision: Mapping[str, Any], *, action: str, reused: b
         "reused": bool(reused),
         "breaker_skip": bool(breaker_skip),
     }
+
+
+# ---------------------------------------------------------------------------
+# 11. 判定记录聚合（纯函数：首页卡片要展示的计数）
+# ---------------------------------------------------------------------------
+
+def parse_decision_records(text: str) -> list[dict[str, Any]]:
+    """解析 JSONL 判定记录文本；坏行/非对象行直接跳过（文件可能被截断或在写入中）。"""
+
+    records: list[dict[str, Any]] = []
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            parsed = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            records.append(parsed)
+    return records
+
+
+def summarize_decision_records(records: Iterable[Any]) -> dict[str, Any]:
+    """把判定记录聚合成首页卡片用的计数（纯函数，不读盘、不含聊天正文）。
+
+    Returns:
+        dict: ``total``（累计判定）、``suppressed``（实际抑制）、``reused``（去重复用）、
+        ``breaker_skip``（熔断跳过）、``shadow_only``（影子模式下"本该抑制"）、
+        ``suppress_rate``（抑制率，``total`` 为 0 时取 0.0）。
+    """
+
+    total = suppressed = reused = breaker_skip = shadow_only = 0
+    for record in records:
+        if not isinstance(record, Mapping):
+            continue
+        total += 1
+        if record.get("suppressed"):
+            suppressed += 1
+        if record.get("reused"):
+            reused += 1
+        if record.get("breaker_skip"):
+            breaker_skip += 1
+        if record.get("would_suppress") and not record.get("suppressed"):
+            shadow_only += 1
+    return {
+        "total": total,
+        "suppressed": suppressed,
+        "reused": reused,
+        "breaker_skip": breaker_skip,
+        "shadow_only": shadow_only,
+        "suppress_rate": (suppressed / total) if total else 0.0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 12. 首页卡片内容块（纯函数：只用文档支持的 markdown / text / stat / key_value）
+# ---------------------------------------------------------------------------
+
+#: ``docs/zh/plugin/home-cards.md`` 推荐的可用内容块类型（Host 会裁剪过长文本）。
+HOME_CARD_BLOCK_TYPES: tuple[str, ...] = ("markdown", "text", "stat", "key_value", "list", "actions")
+
+
+def build_home_card_blocks(summary: Mapping[str, Any], *, breaker_open: bool,
+                           cooldown_remaining: float = 0.0, breaker_hits: int = 0,
+                           probability_threshold: float = 0.80) -> list[dict[str, Any]]:
+    """构造首页卡片内容块（纯函数，不做任何 I/O）。
+
+    只使用文档推荐的 ``markdown`` / ``stat`` / ``key_value`` 内容块，**不产生**
+    HTML/JS（``docs/zh/plugin/home-cards.md:85``：WebUI 不执行插件提供的 HTML/JS）。
+    数值全部来自本地判定记录，**不含聊天正文**。
+    """
+
+    total = int(summary.get("total") or 0)
+    suppressed = int(summary.get("suppressed") or 0)
+    reused = int(summary.get("reused") or 0)
+    shadow_only = int(summary.get("shadow_only") or 0)
+    rate = float(summary.get("suppress_rate") or 0.0)
+    threshold = float(probability_threshold)
+    hits = int(breaker_hits)
+
+    breaker_value = "已打开" if breaker_open else "关闭"
+    breaker_detail = ("冷却剩余 %.0f 秒" % float(cooldown_remaining)) if breaker_open \
+        else ("累计跳过 %d 轮" % hits)
+
+    blocks: list[dict[str, Any]] = [
+        {"type": "markdown",
+         "content": "**Jev 参与门控**：用 Jev 判定本轮是否值得进入完整 planner；"
+                    "以下计数来自本地判定记录（**不含聊天正文**）。"},
+        {"type": "stat", "label": "累计判定", "value": str(total),
+         "detail": "抑制 %d 次" % suppressed},
+        {"type": "stat", "label": "抑制率", "value": "%.0f%%" % (rate * 100.0),
+         "detail": "抑制阈值 p(no_reply) ≥ %.2f" % threshold},
+        {"type": "stat", "label": "去重复用", "value": str(reused),
+         "detail": "同内容指纹只判定一次"},
+        {"type": "stat", "label": "熔断", "value": breaker_value, "detail": breaker_detail},
+        {"type": "key_value", "entries": {
+            "累计判定": str(total),
+            "实际抑制": str(suppressed),
+            "去重复用": str(reused),
+            "熔断跳过": str(hits),
+        }},
+    ]
+    if shadow_only:
+        blocks.append({"type": "markdown", "content": "影子模式：另有 %d 轮「本该抑制」未改行为。" % shadow_only})
+    return blocks

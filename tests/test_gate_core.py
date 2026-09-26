@@ -15,6 +15,10 @@ from gate_core import (  # noqa: E402
     build_gate_skip_item,
     build_request,
     build_decision_record,
+    build_home_card_blocks,
+    HOME_CARD_BLOCK_TYPES,
+    parse_decision_records,
+    summarize_decision_records,
     evaluate_decision,
     extract_planner_state_text,
     is_bot_addressed,
@@ -331,6 +335,60 @@ def test_decision_record():
           chat_text not in json.dumps(rec5, ensure_ascii=False), True)
 
 
+def test_records_and_card():
+    print("\n[10] parse/summarize_decision_records + build_home_card_blocks（首页卡片）")
+
+    text = "\n".join([
+        json.dumps({"suppressed": True, "would_suppress": True, "reused": False, "breaker_skip": False}),
+        json.dumps({"suppressed": False, "would_suppress": False, "reused": True, "breaker_skip": False}),
+        json.dumps({"suppressed": False, "would_suppress": True, "reused": False, "breaker_skip": True}),
+    ])
+    records = parse_decision_records(text)
+    check("parse：3 行有效记录", len(records), 3)
+    check("parse：坏行跳过", len(parse_decision_records('{"a":1}\n{not json\n\n[]\n')), 1)
+    check("parse：非对象行跳过", len(parse_decision_records('[1,2]\n"x"\n')), 0)
+    check("parse：空文本 → 空列表", parse_decision_records(""), [])
+
+    summary = summarize_decision_records(records)
+    check("summary：total", summary["total"], 3)
+    check("summary：suppressed", summary["suppressed"], 1)
+    check("summary：reused", summary["reused"], 1)
+    check("summary：breaker_skip", summary["breaker_skip"], 1)
+    check("summary：shadow_only（本该抑制未改行为）", summary["shadow_only"], 1)
+    check("summary：suppress_rate = 1/3", round(summary["suppress_rate"], 4), round(1 / 3, 4))
+    check("summary：空输入 rate = 0.0", summarize_decision_records([])["suppress_rate"], 0.0)
+    check("summary：非 Mapping 行被忽略", summarize_decision_records([None, "x", 3])["total"], 0)
+
+    blocks = build_home_card_blocks(summary, breaker_open=False, breaker_hits=1,
+                                    probability_threshold=0.80)
+    check("card：只用文档白名单块类型",
+          all(b["type"] in HOME_CARD_BLOCK_TYPES for b in blocks), True)
+    check("card：内容块串里没有 html/script",
+          all(("html" not in json.dumps(b, ensure_ascii=False).lower()
+               and "script" not in json.dumps(b, ensure_ascii=False).lower()) for b in blocks), True)
+    stats = {b["label"]: b for b in blocks if b["type"] == "stat"}
+    check("card：累计判定", stats["累计判定"]["value"], "3")
+    check("card：抑制率 33%", stats["抑制率"]["value"], "33%")
+    check("card：抑制阈值写进 detail", stats["抑制率"]["detail"], "抑制阈值 p(no_reply) ≥ 0.80")
+    check("card：去重复用", stats["去重复用"]["value"], "1")
+    check("card：熔断关闭 + 累计跳过", (stats["熔断"]["value"], stats["熔断"]["detail"]),
+          ("关闭", "累计跳过 1 轮"))
+    check("card：影子提示块出现",
+          any("影子模式" in b.get("content", "") for b in blocks), True)
+    check("card：含 key_value 汇总块",
+          any(b["type"] == "key_value" for b in blocks), True)
+
+    blocks2 = build_home_card_blocks(summarize_decision_records([]), breaker_open=True,
+                                     cooldown_remaining=42.0)
+    stats2 = {b["label"]: b for b in blocks2 if b["type"] == "stat"}
+    check("card：零值 + 熔断打开",
+          (stats2["累计判定"]["value"], stats2["抑制率"]["value"],
+           stats2["熔断"]["value"], stats2["熔断"]["detail"]),
+          ("0", "0%", "已打开", "冷却剩余 42 秒"))
+    check("card：零记录无影子提示块",
+          any("影子模式" in b.get("content", "") for b in blocks2), False)
+
+
 if __name__ == "__main__":
     test_extract()
     test_mention_window()
@@ -341,5 +399,6 @@ if __name__ == "__main__":
     test_allowlist()
     test_dedup_breaker()
     test_decision_record()
+    test_records_and_card()
     print("\n通过 %d / 失败 %d" % (PASS, FAIL))
     sys.exit(1 if FAIL else 0)

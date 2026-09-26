@@ -54,6 +54,17 @@ def _hook_handler(*args, **kwargs):
 _sdk.HookHandler = _hook_handler
 
 
+def _home_card(*args, **kwargs):
+    """HomeCard 桩：工厂，返回一个「原样返回函数」的装饰器。"""
+
+    def deco(fn):
+        return fn
+    return deco
+
+
+_sdk.HomeCard = _home_card
+
+
 class _MaiBotPlugin:
     """MaiBotPlugin 桩：普通类即可（插件子类不需要 SDK 的元类/初始化）。"""
 
@@ -895,6 +906,87 @@ def test_record_persistence():
         shutil.rmtree(data_dir, ignore_errors=True)
 
 
+def test_home_card():
+    print("\n[15] 首页卡片：内容块类型合法、数值来自判定记录、缺失/异常降级（todo 11）")
+    data_dir = tempfile.mkdtemp(prefix="jev_gate_card_")
+    try:
+        record_path = os.path.join(data_dir, _plugin_mod.DECISION_RECORD_FILE)
+        inst, _ctx = _build_instance(data_dir)
+
+        # ---- 15a. 无记录文件 → 零值、类型合法、不报错 ----
+        blocks = asyncio.run(inst.home_card())
+        check("卡片：返回非空内容块列表", isinstance(blocks, list) and bool(blocks), True)
+        check("卡片：内容块类型都在文档白名单内",
+              all(b.get("type") in core.HOME_CARD_BLOCK_TYPES for b in blocks), True)
+        stats = {b["label"]: b for b in blocks if b.get("type") == "stat"}
+        check("卡片：零值（累计判定）", stats["累计判定"]["value"], "0")
+        check("卡片：零值（抑制率）", stats["抑制率"]["value"], "0%")
+        check("卡片：零值（熔断）", stats["熔断"]["value"], "关闭")
+
+        # ---- 15b. 有记录 → 数值与记录一致，且不含聊天正文 ----
+        rows = [
+            {"ts": "t1", "action": "suppress", "reason": "suppress", "choice": "no_reply",
+             "confidence": 0.7, "p_no_reply": 0.95, "suppressed": True, "would_suppress": True,
+             "reused": False, "breaker_skip": False},
+            {"ts": "t2", "action": "continue", "reason": "not_no_reply", "choice": "continue",
+             "confidence": 0.9, "p_no_reply": 0.05, "suppressed": False, "would_suppress": False,
+             "reused": True, "breaker_skip": False},
+            {"ts": "t3", "action": "continue", "reason": "breaker_open", "choice": None,
+             "confidence": None, "p_no_reply": None, "suppressed": False, "would_suppress": False,
+             "reused": False, "breaker_skip": True},
+        ]
+        with open(record_path, "w", encoding="utf-8") as fh:
+            for row in rows:
+                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+        blocks2 = asyncio.run(inst.home_card())
+        stats2 = {b["label"]: b for b in blocks2 if b.get("type") == "stat"}
+        check("卡片：累计判定 = 记录行数", stats2["累计判定"]["value"], "3")
+        check("卡片：抑制率 = 1/3 → 33%", stats2["抑制率"]["value"], "33%")
+        check("卡片：去重复用 = 1", stats2["去重复用"]["value"], "1")
+        check("卡片：熔断累计跳过 = 1 轮", stats2["熔断"]["detail"], "累计跳过 1 轮")
+        entries = [b for b in blocks2 if b.get("type") == "key_value"][0]["entries"]
+        check("卡片：key_value 实际抑制 = 1", entries["实际抑制"], "1")
+        dumped = json.dumps(blocks2, ensure_ascii=False)
+        check("卡片：不含聊天正文与昵称",
+              ("小助手" not in dumped) and ("最近一句聊天" not in dumped), True)
+
+        # ---- 15c. 坏行/空行被跳过，不影响计数 ----
+        with open(record_path, "a", encoding="utf-8") as fh:
+            fh.write("{not json\n\n")
+        blocks3 = asyncio.run(inst.home_card())
+        stats3 = {b["label"]: b for b in blocks3 if b.get("type") == "stat"}
+        check("卡片：坏行被跳过（计数仍 3）", stats3["累计判定"]["value"], "3")
+
+        # ---- 15d. 熔断打开 → 显示已打开与冷却剩余 ----
+        async def _open_and_render():
+            inst._breaker().opened_at = asyncio.get_running_loop().time()
+            return await inst.home_card()
+
+        blocks4 = asyncio.run(_open_and_render())
+        stats4 = {b["label"]: b for b in blocks4 if b.get("type") == "stat"}
+        check("卡片：熔断打开 → 已打开", stats4["熔断"]["value"], "已打开")
+        check("卡片：熔断打开 → 显示冷却剩余",
+              stats4["熔断"]["detail"].startswith("冷却剩余"), True)
+
+        # ---- 15e. ctx.paths 访问抛异常 → 仍返回合法内容块，不抛异常 ----
+        class _BoomPaths:
+            @property
+            def data_dir(self):
+                raise OSError("boom")
+
+        inst_bad, _c = _build_instance(data_dir)
+        inst_bad.ctx.paths = _BoomPaths()
+        blocks5 = asyncio.run(inst_bad.home_card())
+        stats5 = {b["label"]: b for b in blocks5 if b.get("type") == "stat"}
+        check("卡片：ctx.paths 异常 → 合法块 + 零值",
+              (isinstance(blocks5, list)
+               and all(b.get("type") in core.HOME_CARD_BLOCK_TYPES for b in blocks5)
+               and stats5["累计判定"]["value"] == "0"), True)
+    finally:
+        shutil.rmtree(data_dir, ignore_errors=True)
+
+
 if __name__ == "__main__":
     try:
         test_finalize()
@@ -911,6 +1003,7 @@ if __name__ == "__main__":
         test_breaker_reset()
         test_dedup_ttl_expiry()
         test_record_persistence()
+        test_home_card()
         print("\n通过 %d / 失败 %d" % (PASS, FAIL))
     finally:
         urllib.request.urlopen = _orig_urlopen

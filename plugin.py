@@ -29,7 +29,7 @@ import urllib.request
 from datetime import datetime
 from typing import Any, Mapping
 
-from maibot_sdk import HookHandler, MaiBotPlugin
+from maibot_sdk import HomeCard, HookHandler, MaiBotPlugin
 from maibot_sdk.types import HookMode, HookOrder
 
 from . import gate_core as core
@@ -44,6 +44,24 @@ DEDUP_TTL_SECONDS = 120.0     # 同一内容指纹在此秒数内视为同一轮
 BREAKER_THRESHOLD = 5         # 连续失败达到此值 → 打开熔断
 BREAKER_COOLDOWN_SECONDS = 300.0  # 熔断打开后的冷却秒数
 DECISION_RECORD_FILE = "gate_decisions.jsonl"  # 判定记录（JSONL：只记判断结果，不含聊天正文）
+
+#: 首页卡片的注册期兜底内容。
+#: 文档（docs/zh/plugin/home-cards.md:53）只描述「卡片内容」，示例是注册期静态列表，
+#: 并未文档化"运行时内容提供者"；因此这里给静态描述块，并由被装饰的
+#: :meth:`JevTimingGatePlugin.home_card` 额外返回实时聚合块——宿主若采用方法返回值
+#: 即展示实时数值，否则回落到这份静态描述。两者都只用文档支持的内容块，不含 HTML/JS。
+_STATIC_CARD_CONTENT: list[dict[str, Any]] = [
+    {
+        "type": "markdown",
+        "content": "**Jev 参与门控**：用 Jev 判定本轮是否值得进入完整 planner，"
+                   "高置信判「无需参与」时把这一轮改写成极简请求。"
+                   "统计来自本地判定记录，**不含聊天正文**。",
+    },
+    {
+        "type": "key_value",
+        "entries": {"记录文件": DECISION_RECORD_FILE, "位置": "插件数据目录（ctx.paths.data_dir）"},
+    },
+]
 
 
 def _append_line(path: str, line: str) -> None:
@@ -401,6 +419,69 @@ class JevTimingGatePlugin(MaiBotPlugin):
             conf_text, original_items, original_tools,
         )
         return {"action": "continue", "modified_kwargs": kwargs}
+
+    # ------------------------------------------------------------------ 首页卡片
+    def _read_records_text(self) -> str:
+        """同步读判定记录全文；文件缺失/不可读一律返回空串（卡片退化为零值）。"""
+
+        path = self._decision_record_path()
+        if not path:
+            return ""
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return fh.read()
+        except Exception:
+            return ""
+
+    async def _home_card_blocks(self) -> list[dict[str, Any]]:
+        """按本地判定记录聚合出首页卡片内容块；读盘走 to_thread，失败即降级为静态描述。"""
+
+        try:
+            text = await asyncio.to_thread(self._read_records_text)
+            summary = core.summarize_decision_records(core.parse_decision_records(text))
+            breaker = self._breaker()
+            now = asyncio.get_running_loop().time()
+            # 只读判断：刻意不调用 breaker_should_skip()，避免渲染卡片时顺手改写熔断状态
+            breaker_open = (
+                breaker.opened_at is not None
+                and now < breaker.opened_at + breaker.cooldown_seconds
+            )
+            remaining = 0.0
+            if breaker_open and breaker.opened_at is not None:
+                remaining = max(0.0, breaker.opened_at + breaker.cooldown_seconds - now)
+            try:
+                threshold = float(self.config.gate.probability_threshold or 0.80)
+            except Exception:
+                threshold = 0.80
+            return core.build_home_card_blocks(
+                summary,
+                breaker_open=breaker_open,
+                cooldown_remaining=remaining,
+                breaker_hits=int(summary.get("breaker_skip") or 0),
+                probability_threshold=threshold,
+            )
+        except Exception as exc:
+            self.ctx.logger.warning("%s：首页卡片内容构造失败（已降级为静态描述）: %s", LOG_TAG, exc)
+            return [dict(block) for block in _STATIC_CARD_CONTENT]
+
+    @HomeCard(
+        "jev_timing_gate",
+        title="Jev 参与门控",
+        description="门控成效：累计判定、抑制率、去重复用与熔断状态",
+        content=_STATIC_CARD_CONTENT,
+        link_url="/plugin-config?plugin=bg4jts.jev-timing-gate",
+        link_label="打开插件配置",
+        width="medium",
+        order=200,
+    )
+    async def home_card(self) -> list[dict[str, Any]]:
+        """首页卡片（被 ``@HomeCard`` 装饰的方法）：返回实时内容块。
+
+        ``@HomeCard`` 的 ``content=`` 是注册期静态内容（见文档示例）；本方法额外返回
+        实时聚合块。两种情形都只用文档支持的内容块类型，不含 HTML/JS。
+        """
+
+        return await self._home_card_blocks()
 
     # ------------------------------------------------------------------ Hook
     @HookHandler(

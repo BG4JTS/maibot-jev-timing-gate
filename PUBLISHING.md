@@ -1,60 +1,34 @@
-# 发布说明（面向本插件的维护者，不是给使用者看的）
+# 发布说明（面向本仓库的维护者）
 
-README 面向使用者；这一份放仓库维护相关的内容。
+本文档服务于**本仓库**（BG4JTS 永久自有的分叉）的维护者，说明仓库的来历、后续怎么改、发布时注意什么。它**不是给使用者看的**：安装、配置、更新等面向最终用户的内容都在 README，那里才是用户入口。
 
-## 一、发布到官方插件中心
+## 一、上游来源与分叉说明
 
-文档：<https://docs.mai-mai.org/plugin/submission> · 插件中心 <https://plugins.maibot.chat/>
-· 索引仓库 [Mai-with-u/plugin-repo](https://github.com/Mai-with-u/plugin-repo)
+本仓库是 krijingle-create 的 `maibot-jev-timing-gate`（一个 MaiBot 插件）的衍生仓库：
 
-**仓库要求**（根目录必须有以下文件）：
+- 上游仓库：<https://github.com/krijingle-create/maibot-jev-timing-gate>
+- 本仓库：`origin` 为 <https://github.com/BG4JTS/maibot-jev-timing-gate>（走 `https://gh.927223.xyz/` 镜像前缀，见 `git remote -v`）
 
-| 文件 | 要求 | 本包状态 |
-|---|---|---|
-| `_manifest.json` | manifest v2，字段规范见文档 | ✅ 已符合（含 `changelog`，SDK 模型里已声明该字段） |
-| `plugin.py` | 含 `create_plugin()` 工厂函数 | ✅ |
-| `LICENSE` | 许可证类型需与 manifest 的 `license` 一致 | ✅ MIT / MIT（版权人待替换） |
-| `README.md` | 建议含功能介绍、安装方式、配置说明、示例 | ✅ |
+**永久独立、不跟踪上游**：本仓库自建立起即为独立维护、独立发布的永久自有分叉，不跟随上游更新，也**不配置 `upstream` remote（以后也不会加）**。
 
-提交方式：在 plugin-repo 开一个 **「Add Plugin / 添加插件」Issue**（填插件 ID + 公开仓库 HTTPS 地址），
-CI 会自动读取你仓库的 `_manifest.json` 校验，结果评论在 Issue 里；通过后维护者 `/approve` 收录。
+由此必然产生的后果：`gate_core.py` 会与上游逐步分叉。**自 v1.1.0 起，本仓库手写维护 `gate_core.py`**——它不再是"由仓库外生成器产出的生成物"（这条旧说法已废弃）。改逻辑直接改本文件，改完跑下面的离线用例。
 
-> `urls.repository` 是插件中心定位你仓库的依据，必须是**真实公开的 GitHub 地址**（见下节）。
+对上游的归属予以保留：`LICENSE` 与 `_manifest.json` 中的作者署名、README 中的致谢均保留对 krijingle-create 的署名。上游项目自己维护了一条"发布到官方插件中心"的流水线（见其仓库），**与本仓库无关**，这里不沿用它。
 
-## 二、发布前要改的东西（已完成 ✅）
+## 二、自有仓库的维护约定
 
-已改为真实地址：`author.url` = `https://github.com/krijingle-create`，`urls.*` 指向 `https://github.com/krijingle-create/maibot-jev-timing-gate`，
-`LICENSE` 版权人 = `krijingle-create`。
+维护者改代码 / 改配置时遵守下面几条：
 
-保留备忘：
+1. **改配置字段结构** → 同时递增 `config.py` 里的 `CONFIG_SCHEMA_VERSION` 与 `_manifest.json` 里的 `version`（版本号是三段式 semver，见下节）。只改逻辑、不动配置结构时，可只递增 `version`。
+2. **`_manifest.json` 是 `extra="forbid"` 严格模式**：用到的字段必须在 SDK 的 manifest 模型里声明过，用到的能力必须写进 `capabilities`（宿主按能力令牌授权，未声明会被拒）。注意：**本仓库故意不添加 `changelog` 字段**——虽然 SDK 文档把它列为可选字段，但 manifest 文档禁止未声明字段，为避免校验失败，此处不用它。
+3. **提交前必跑离线用例**：`python tests/test_gate_core.py` 与 `python tests/test_plugin_gate.py`（纯 python，无 pytest，无第三方依赖）。
+4. **`config.toml` 与 `jev_config.json` 永不入库**（已在 `.gitignore`）：前者是运行时生成 / 用户填写的配置，后者可能含密钥。
+5. **每个改动一个 conventional commit**：一次提交只做一件事，message 用 `type(scope): description` 格式（如 `fix(gate): ...`、`docs(...): ...`）。
 
-1. 改配置字段结构时记得递增 `config.py` 里的 `CONFIG_SCHEMA_VERSION`（当前 1.0.0）与
-   `_manifest.json` 的 `version`。
+## 三、本仓库自身的版本
 
-## 三、开发约定
+- 插件 ID：`bg4jts.jev-timing-gate`
+- 版本号：三段式 semver，记录在 `_manifest.json` 的 `version`。
+- 变更历史不单列文件（不新增 `CHANGELOG.md`），靠 conventional commit 的 message 承载。
 
-- `gate_core.py` 是**生成物**：源头是仓库外的 `gen_gate_core.py`（从生产实现里用 AST 抽取 + 脱敏 + 拼装
-  多提供商适配层）。要改逻辑先改生成器再重跑，别直接改生成结果。
-- 改动后请跑离线用例：`python tests/test_gate_core.py`（当前 65 条）。
-- `_manifest.json` 是 `extra="forbid"` 严格模式：**用到的字段必须在 SDK 的 manifest 模型里声明过**；
-  用到的能力必须写进 `capabilities`（宿主按能力令牌授权，未声明会被拒）。
-- 提交前自检：`config.toml` 不要入库（已在 `.gitignore`）；`jev_config.json`（若用于存 key）也不要入库。
-
-## 四、审核回应记录
-
-### 2026-09-22 核心补丁与宿主文件直读（1.0.0 → 1.0.1）
-
-审核要求：插件包不要附带改动宿主核心的手段；去掉绕过 `config.get`、直读宿主配置文件的兜底。处理如下。
-
-1. 删除 `core_patch/apply_gate_abort_patch.py`（会改写宿主 `src/maisaka/chat_loop_service.py` 的
-   abort 补丁，靠字符串锚点维持）。官方 Hook 表把 `maisaka.planner.before_request` 标为
-   「允许 abort ❌ · 允许改参 ✅」，插件改为只走「改参」这一条路：把本轮 items 换成一条跳过提示、
-   清空 `tool_definitions`，返回 `{"action": "continue", "modified_kwargs": ...}`。
-   要做到抑制轮零 token，需要宿主开放该 hook 的 abort，本插件不再自行争取。
-   脚本仍留在 git 历史里：`git show 21e9f99:core_patch/apply_gate_abort_patch.py`。
-2. 删除 `plugin.py` 的 `_nickname_from_file()`（反向遍历父目录直读 `config/bot_config.toml`）。
-   昵称现在只通过 `config.get` 能力读；读不到就拒绝启用门控，并在日志里要求手填 `[gate] bot_aliases`。
-   这条能力路径在真实环境验证过（加载日志 `别名=['花子']（来源：自动读主程序配置 bot.nickname）`）。
-
-配置字段没有变化，`CONFIG_SCHEMA_VERSION` 保持 1.0.0；只递增了 `_manifest.json` 的 `version`。
-对使用者的行为影响：抑制轮不再可能零 token，固定走原有的「极简改写」路径；判定逻辑与阈值不变。
+改动后的完整工作流：改 `config.py` + `_manifest.json` 版本 → 跑两个测试文件 → `git add` 相关文件（不含 `config.toml` / `jev_config.json`）→ 一个 conventional commit → push。

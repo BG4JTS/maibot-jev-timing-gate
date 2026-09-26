@@ -10,9 +10,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import uuid
+from collections import OrderedDict
 from datetime import datetime
 from typing import Any, Iterable, Mapping
 
@@ -493,3 +495,58 @@ def resolve_auth(api_style: str, header: str = "", prefix: str = "") -> tuple[st
         header_name = raw_header or default_header
     prefix_value = "" if raw_prefix.lower() == "none" else (raw_prefix or default_prefix)
     return header_name, prefix_value
+
+
+# ---------------------------------------------------------------------------
+# 7. 每轮去重（纯函数；时间一律由调用方注入）
+# ---------------------------------------------------------------------------
+
+def turn_fingerprint(state_text: str, hint: str = "") -> str:
+    """计算一轮聊天的内容指纹，作为去重键。
+
+    有真实聊天内容时**只用内容**、刻意不让 ``hint`` 参与：去重必须保守——
+    同样的聊天内容必须永远映射到同一轮，否则一个不同的 ``hint`` 可能让同一条
+    消息被判定两次，产生第二次付费 Jev 调用。该挂载点（
+    ``maisaka.planner.before_request``）的文档（``docs/zh/plugin/hooks.md:248``）
+    没有暴露任何轮次/会话 id，内容指纹是唯一站得住的键；``hint`` 只在内容
+    为空时兜底。
+    """
+
+    text = str(state_text or "").strip()
+    if text:
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
+    return hashlib.sha256(("hint:" + str(hint or "").strip()).encode("utf-8")).hexdigest()[:32]
+
+
+class DedupCache:
+    """有界 LRU + TTL 缓存，时钟**永远**由调用方注入（``now`` 参数）。
+
+    存 ``(expires_at, value)`` 对；``value`` 对缓存不透明（``Any``）。
+    TTL 过期与 LRU 淘汰都只在 ``get``/``put`` 时惰性处理。
+    """
+
+    def __init__(self, capacity: int = 256, ttl_seconds: float = 120.0) -> None:
+        self.capacity = max(1, int(capacity))
+        self.ttl_seconds = float(ttl_seconds)
+        self._store: OrderedDict[str, tuple[float, Any]] = OrderedDict()
+
+    def get(self, key: str, now: float) -> Any | None:
+        entry = self._store.get(key)
+        if entry is None:
+            return None
+        expires_at, value = entry
+        if now >= expires_at:
+            del self._store[key]
+            return None
+        self._store.move_to_end(key)
+        return value
+
+    def put(self, key: str, value: Any, now: float) -> None:
+        expires_at = now + self.ttl_seconds
+        self._store[key] = (expires_at, value)
+        self._store.move_to_end(key)
+        while len(self._store) > self.capacity:
+            self._store.popitem(last=False)
+
+    def __len__(self) -> int:
+        return len(self._store)

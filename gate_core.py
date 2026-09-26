@@ -245,13 +245,18 @@ def evaluate_decision(
     conf_text = f"{confidence:.2f}" if confidence is not None else "?"
     probability = probabilities.get("no_reply") if isinstance(probabilities, dict) else None
     p_text = f"{probability:.2f}" if isinstance(probability, (int, float)) else "?"
+    # 原始数值随判定结果一起返回，供持久化记录使用（不含任何聊天文本）。
+    conf_value = float(confidence) if confidence is not None else None
+    prob_value = float(probability) if isinstance(probability, (int, float)) else None
 
     if choice is None:
         return {"suppress": False, "reason": "no_result", "evidence": "", "value": 0.0,
-                "limit": 0.0, "conf_text": conf_text, "p_text": p_text}
+                "limit": 0.0, "conf_text": conf_text, "p_text": p_text,
+                "confidence": conf_value, "p_no_reply": prob_value}
     if choice != "no_reply":
         return {"suppress": False, "reason": "not_no_reply", "evidence": "", "value": 0.0,
-                "limit": 0.0, "conf_text": conf_text, "p_text": p_text}
+                "limit": 0.0, "conf_text": conf_text, "p_text": p_text,
+                "confidence": conf_value, "p_no_reply": prob_value}
 
     if isinstance(probability, (int, float)):
         limit = float(probability_threshold)
@@ -269,6 +274,8 @@ def evaluate_decision(
         "limit": limit,
         "conf_text": conf_text,
         "p_text": p_text,
+        "confidence": conf_value,
+        "p_no_reply": prob_value,
     }
 
 
@@ -682,3 +689,29 @@ def finalize_gate_decision(decision: Mapping[str, Any], *, shadow_mode: bool) ->
     if shadow_mode:
         return {"action": GATE_ACTION_CONTINUE, "reason": "shadow"}
     return {"action": "suppress", "reason": "suppress"}
+
+
+# ---------------------------------------------------------------------------
+# 10. 判定记录序列化（纯函数：把判定归一成不含聊天正文的持久化记录）
+# ---------------------------------------------------------------------------
+
+def build_decision_record(decision: Mapping[str, Any], *, action: str, reused: bool,
+                          breaker_skip: bool, timestamp: str) -> dict[str, Any]:
+    """把一次门控判定归一成**不含聊天正文**的持久化记录。
+
+    只记录「判断了什么」：时间戳、动作、choice、confidence、p_no_reply、
+    是否抑制、是否复用、是否熔断。**绝不记录**送判的聊天文本、昵称或提示词。
+    """
+
+    return {
+        "ts": str(timestamp),
+        "action": str(action),
+        "reason": str(decision.get("reason") or ""),
+        "choice": decision.get("choice"),
+        "confidence": decision.get("confidence"),
+        "p_no_reply": decision.get("p_no_reply"),
+        "suppressed": action == "suppress",
+        "would_suppress": bool(decision.get("suppress")),
+        "reused": bool(reused),
+        "breaker_skip": bool(breaker_skip),
+    }

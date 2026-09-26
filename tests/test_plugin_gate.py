@@ -749,6 +749,152 @@ def test_dedup_ttl_expiry():
         shutil.rmtree(data_dir, ignore_errors=True)
 
 
+def test_record_persistence():
+    print("\n[14] 判定记录持久化：JSONL 追加、不含聊天正文、失败不炸、早退不记（todo 10）")
+    data_dir = tempfile.mkdtemp(prefix="jev_gate_rec_")
+    bad_root = tempfile.mkdtemp(prefix="jev_gate_recbad_")
+    try:
+        record_path = os.path.join(data_dir, _plugin_mod.DECISION_RECORD_FILE)
+
+        def _lines():
+            if not os.path.exists(record_path):
+                return []
+            with open(record_path, encoding="utf-8") as fh:
+                return [ln for ln in fh.read().splitlines() if ln]
+
+        # ---- 1. 抑制判定 → 恰好 1 行合法 JSON，字段精确，不含聊天正文 ----
+        inst, ctx = _build_instance(data_dir)
+        calls = []
+
+        async def fake_ask(text, cfg, aliases):
+            calls.append(text)
+            return "no_reply", 0.90, {"no_reply": 0.95}
+
+        inst._ask_choice = fake_ask
+        kw = {"items": [CHAT_ITEM], "tool_definitions": [{"name": "tool_a"}]}
+        out1 = asyncio.run(_run_maybe_gate(inst, kw))
+        check("记录：抑制轮返回 continue+modified_kwargs", out1["action"], "continue")
+        lines = _lines()
+        check("记录：抑制轮后文件恰好 1 行", len(lines), 1)
+        rec1 = json.loads(lines[0])
+        check("记录：第 1 行是合法 JSON", isinstance(rec1, dict), True)
+        check("记录：action=suppress", rec1["action"], "suppress")
+        check("记录：choice=no_reply", rec1["choice"], "no_reply")
+        check("记录：confidence=0.90", rec1["confidence"], 0.90)
+        check("记录：p_no_reply=0.95", rec1["p_no_reply"], 0.95)
+        check("记录：suppressed=True", rec1["suppressed"], True)
+        check("记录：would_suppress=True", rec1["would_suppress"], True)
+        check("记录：reused=False", rec1["reused"], False)
+        check("记录：breaker_skip=False", rec1["breaker_skip"], False)
+        check("记录：不含聊天正文（json.dumps 全串断言）",
+              "最近一句聊天" not in json.dumps(rec1, ensure_ascii=False), True)
+        print("    FIRST_RECORD=" + lines[0])
+        print("    FIRST_RECORD_JSON=" + json.dumps(rec1, ensure_ascii=False))
+
+        # ---- 2. 同 state 第二次（去重命中）→ 第 2 行 reused=True，调用数不变 ----
+        out2 = asyncio.run(_run_maybe_gate(inst, {"items": [CHAT_ITEM],
+                                                  "tool_definitions": [{"name": "tool_a"}]}))
+        check("记录：去重命中轮返回 continue+modified_kwargs", out2["action"], "continue")
+        lines2 = _lines()
+        check("记录：去重命中后文件恰好 2 行", len(lines2), 2)
+        rec2 = json.loads(lines2[1])
+        check("记录：第 2 行 reused=True", rec2["reused"], True)
+        check("记录：第 2 行 action=suppress（复用抑制判定）", rec2["action"], "suppress")
+        check("记录：第 2 行 breaker_skip=False", rec2["breaker_skip"], False)
+        check("记录：去重命中后 _ask_choice 调用数不变", len(calls), 1)
+
+        # ---- 3. 熔断跳过 → 新行 breaker_skip=True reason=breaker_open ----
+        inst_b, ctx_b = _build_instance(data_dir)
+        calls_b = []
+
+        async def fake_fail(text, cfg, aliases):
+            calls_b.append(text)
+            return None, None, {}
+
+        inst_b._ask_choice = fake_fail
+        threshold = _plugin_mod.BREAKER_THRESHOLD
+        for i in range(threshold):
+            asyncio.run(_run_maybe_gate(inst_b, {"items": [_chat_item("熔断失败%d" % i)]}))
+        n_before = len(_lines())
+        ctx_b.logger.entries.clear()
+        out_b = asyncio.run(_run_maybe_gate(inst_b, {"items": [_chat_item("熔断期内新状态")]}))
+        check("记录：熔断跳过 → 返回裸 continue", out_b, {"action": "continue"})
+        lines_b = _lines()
+        check("记录：熔断跳过后行数恰好 +1", len(lines_b), n_before + 1)
+        rec_b = json.loads(lines_b[-1])
+        check("记录：熔断行 breaker_skip=True", rec_b["breaker_skip"], True)
+        check("记录：熔断行 reason=breaker_open", rec_b["reason"], "breaker_open")
+        check("记录：熔断行 action=continue", rec_b["action"], "continue")
+        check("记录：熔断行 reused=False", rec_b["reused"], False)
+        check("记录：熔断行 suppressed=False", rec_b["suppressed"], False)
+
+        # ---- 4. 不可写 data_dir → 门控正常、桩正常、无异常、有告警 ----
+        bad_base = os.path.join(bad_root, "iamafile")
+        with open(bad_base, "w", encoding="utf-8") as fh:
+            fh.write("blocker")
+        inst_bad, ctx_bad = _build_instance(bad_base)
+        calls_bad = []
+
+        async def fake_ask_bad(text, cfg, aliases):
+            calls_bad.append(text)
+            return "no_reply", 0.90, {"no_reply": 0.95}
+
+        inst_bad._ask_choice = fake_ask_bad
+        out_bad = asyncio.run(_run_maybe_gate(inst_bad, {"items": [CHAT_ITEM]}))
+        check("记录失败：仍返回 continue+modified_kwargs", out_bad["action"], "continue")
+        check("记录失败：_ask_choice 正常调用 1 次", len(calls_bad), 1)
+        record_warn = [a for a in ctx_bad.logger.entries
+                       if a[0] == "warning" and "判定记录写入失败" in a[1][0]]
+        check("记录失败：logger 记录 1 条「判定记录写入失败」告警", len(record_warn), 1)
+
+        # ---- 5. 早退路径（disabled/no_credentials/no_aliases/empty_state/mentioned）→ 不新增行 ----
+        class _EmptyNick:
+            async def get(self, key, default=None):
+                return "" if key == "bot.nickname" else default
+
+        def _count():
+            return len(_lines())
+
+        def _fresh(**plugin_over):
+            p = {"enabled": True, "api_key": "test-key",
+                 "endpoint": "https://example.invalid/v1/systemone"}
+            p.update(plugin_over)
+            i, _c = _build_instance(data_dir)
+            i.config = _plugin_mod.GateSettings(plugin=p, gate={"bot_aliases": ["小助手"]})
+            return i
+
+        n0 = _count()
+        asyncio.run(_run_maybe_gate(_fresh(enabled=False), {"items": [CHAT_ITEM]}))
+        check("记录：disabled 早退不新增行", _count() - n0, 0)
+
+        n0 = _count()
+        asyncio.run(_run_maybe_gate(_fresh(api_key=""), {"items": [CHAT_ITEM]}))
+        check("记录：no_credentials 早退不新增行", _count() - n0, 0)
+
+        inst_a, ctx_a = _build_instance(data_dir)
+        inst_a.config = _plugin_mod.GateSettings(
+            plugin={"enabled": True, "api_key": "test-key",
+                    "endpoint": "https://example.invalid/v1/systemone"},
+            gate={"bot_aliases": []},
+        )
+        inst_a.ctx.config = _EmptyNick()
+        n0 = _count()
+        asyncio.run(_run_maybe_gate(inst_a, {"items": [CHAT_ITEM]}))
+        check("记录：no_aliases 早退不新增行", _count() - n0, 0)
+
+        n0 = _count()
+        asyncio.run(_run_maybe_gate(_fresh(), {"items": []}))
+        check("记录：empty_state 早退不新增行", _count() - n0, 0)
+
+        n0 = _count()
+        asyncio.run(_run_maybe_gate(_fresh(), {"items": [MENTION_ITEM]}))
+        check("记录：mentioned 早退不新增行", _count() - n0, 0)
+    finally:
+        os.remove(os.path.join(bad_root, "iamafile"))
+        os.rmdir(bad_root)
+        shutil.rmtree(data_dir, ignore_errors=True)
+
+
 if __name__ == "__main__":
     try:
         test_finalize()
@@ -764,6 +910,7 @@ if __name__ == "__main__":
         test_breaker()
         test_breaker_reset()
         test_dedup_ttl_expiry()
+        test_record_persistence()
         print("\n通过 %d / 失败 %d" % (PASS, FAIL))
     finally:
         urllib.request.urlopen = _orig_urlopen

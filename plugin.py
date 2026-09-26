@@ -26,7 +26,8 @@ import asyncio
 import json
 import os
 import urllib.request
-from typing import Any
+from datetime import datetime
+from typing import Any, Mapping
 
 from maibot_sdk import HookHandler, MaiBotPlugin
 from maibot_sdk.types import HookMode, HookOrder
@@ -42,6 +43,14 @@ DEDUP_CAPACITY = 256          # 去重缓存容量（有界 LRU）
 DEDUP_TTL_SECONDS = 120.0     # 同一内容指纹在此秒数内视为同一轮
 BREAKER_THRESHOLD = 5         # 连续失败达到此值 → 打开熔断
 BREAKER_COOLDOWN_SECONDS = 300.0  # 熔断打开后的冷却秒数
+DECISION_RECORD_FILE = "gate_decisions.jsonl"  # 判定记录（JSONL：只记判断结果，不含聊天正文）
+
+
+def _append_line(path: str, line: str) -> None:
+    """把一行 JSON 追加到 JSONL 文件（同步 helper，由调用方经 asyncio.to_thread 执行）。"""
+
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
 
 
 class JevTimingGatePlugin(MaiBotPlugin):
@@ -130,6 +139,14 @@ class JevTimingGatePlugin(MaiBotPlugin):
 
         try:
             return os.path.join(str(self.ctx.paths.data_dir), PRIVATE_KEY_FILE)
+        except Exception:
+            return ""
+
+    def _decision_record_path(self) -> str:
+        """解析判定记录文件路径：ctx.paths.data_dir（宿主规范持久化目录）；ctx/paths 缺失不崩溃。"""
+
+        try:
+            return os.path.join(str(self.ctx.paths.data_dir), DECISION_RECORD_FILE)
         except Exception:
             return ""
 
@@ -253,6 +270,32 @@ class JevTimingGatePlugin(MaiBotPlugin):
         return state
 
     # ------------------------------------------------------------------ 门控主体
+    async def _record_decision(self, decision: Mapping[str, Any] | None, *, action: str,
+                               reason: str, reused: bool, breaker_skip: bool) -> None:
+        """把一次判定追加到 ctx.paths.data_dir 的 JSONL 记录文件。
+
+        磁盘 IO 走 asyncio.to_thread，绝不在事件循环里同步读写；
+        任何写入失败只记日志、**不得**影响门控结果（整体 try/except 包住）。
+        """
+
+        try:
+            path = self._decision_record_path()
+            if not path:
+                return
+            payload = dict(decision or {})
+            if reason:
+                payload["reason"] = reason
+            record = core.build_decision_record(
+                payload,
+                action=action,
+                reused=reused,
+                breaker_skip=breaker_skip,
+                timestamp=datetime.now().isoformat(timespec="seconds"),
+            )
+            await asyncio.to_thread(_append_line, path, json.dumps(record, ensure_ascii=False))
+        except Exception as exc:
+            self.ctx.logger.warning("%s：判定记录写入失败（已忽略，不影响门控）: %s", LOG_TAG, exc)
+
     async def _maybe_gate(self, kwargs: dict[str, Any]) -> dict[str, Any]:
         cfg = self._cfg()
         if not cfg.get("enabled") or not cfg.get("gate_enabled"):
@@ -288,6 +331,10 @@ class JevTimingGatePlugin(MaiBotPlugin):
                     "%s：判定端点连续失败已熔断，冷却剩余 %.0f 秒，本轮跳过判定直接放行",
                     LOG_TAG, remaining,
                 )
+                await self._record_decision(
+                    None, action="continue", reason="breaker_open",
+                    reused=False, breaker_skip=True,
+                )
             # 其余 reason（disabled/gate_disabled/no_credentials/no_aliases/empty_state）
             # 与改动前一致：静默放行
             return {"action": "continue"}
@@ -316,6 +363,13 @@ class JevTimingGatePlugin(MaiBotPlugin):
 
         # ---- ③ 收尾判定：继续 或 抑制 ----
         outcome = core.finalize_gate_decision(decision, shadow_mode=bool(cfg.get("shadow_mode")))
+        await self._record_decision(
+            decision,
+            action=outcome["action"],
+            reason=outcome["reason"],
+            reused=plan["action"] == core.GATE_ACTION_REUSE,
+            breaker_skip=False,
+        )
         if outcome["action"] == core.GATE_ACTION_CONTINUE:
             if outcome["reason"] == "not_no_reply":
                 self.ctx.logger.info(

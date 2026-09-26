@@ -3,6 +3,7 @@
 直接跑：python tests/test_gate_core.py
 """
 
+import json
 import os
 import sys
 
@@ -13,6 +14,7 @@ from gate_core import (  # noqa: E402
     DEFAULT_MENTION_WINDOW_CHARS,
     build_gate_skip_item,
     build_request,
+    build_decision_record,
     evaluate_decision,
     extract_planner_state_text,
     is_bot_addressed,
@@ -273,6 +275,62 @@ def test_dedup_breaker():
     check("4 失败 + 1 成功 + 1 失败 → 不打开", breaker_should_skip(s2, 6.0), False)
 
 
+# ---------------------------------------------------------------- 9. 判定记录序列化（todo 10）
+def test_decision_record():
+    print("\n[9] build_decision_record（不含聊天正文的判定记录）")
+    ts = "2026-09-26T12:00:00"
+
+    d = {"suppress": True, "reason": "", "choice": "no_reply", "confidence": 0.90,
+         "p_no_reply": 0.95, "evidence": "p_no_reply", "value": 0.95, "limit": 0.80}
+    rec = build_decision_record(d, action="suppress", reused=False, breaker_skip=False, timestamp=ts)
+    check("抑制记录：action=suppress", rec["action"], "suppress")
+    check("抑制记录：ts 原样", rec["ts"], ts)
+    check("抑制记录：reason 空串归一", rec["reason"], "")
+    check("抑制记录：choice", rec["choice"], "no_reply")
+    check("抑制记录：confidence", rec["confidence"], 0.90)
+    check("抑制记录：p_no_reply", rec["p_no_reply"], 0.95)
+    check("抑制记录：suppressed=True", rec["suppressed"], True)
+    check("抑制记录：would_suppress=True", rec["would_suppress"], True)
+    check("抑制记录：reused=False", rec["reused"], False)
+    check("抑制记录：breaker_skip=False", rec["breaker_skip"], False)
+
+    d2 = {"suppress": False, "reason": "no_result", "choice": None,
+          "confidence": None, "p_no_reply": None}
+    rec2 = build_decision_record(d2, action="continue", reused=False, breaker_skip=False, timestamp="t")
+    check("no_result：action=continue", rec2["action"], "continue")
+    check("no_result：reason=no_result", rec2["reason"], "no_result")
+    check("no_result：choice=None", rec2["choice"], None)
+    check("no_result：confidence=None", rec2["confidence"], None)
+    check("no_result：p_no_reply=None", rec2["p_no_reply"], None)
+    check("no_result：suppressed=False", rec2["suppressed"], False)
+    check("no_result：would_suppress=False", rec2["would_suppress"], False)
+
+    d3 = {"suppress": True, "choice": "no_reply", "confidence": 0.90, "p_no_reply": 0.95}
+    rec3 = build_decision_record(d3, action="continue", reused=False, breaker_skip=False, timestamp="t")
+    check("影子记录：action=continue（未实际抑制）", rec3["action"], "continue")
+    check("影子记录：suppressed=False", rec3["suppressed"], False)
+    check("影子记录：would_suppress=True（本该抑制）", rec3["would_suppress"], True)
+
+    rec4 = build_decision_record({}, action="continue", reused=True, breaker_skip=True, timestamp="t")
+    check("缺键：reason 降级为空串", rec4["reason"], "")
+    check("缺键：choice=None", rec4["choice"], None)
+    check("缺键：confidence=None", rec4["confidence"], None)
+    check("缺键：p_no_reply=None", rec4["p_no_reply"], None)
+    check("缺键：would_suppress=False", rec4["would_suppress"], False)
+    check("缺键：suppressed=False", rec4["suppressed"], False)
+    check("缺键：reused=True 透传", rec4["reused"], True)
+    check("缺键：breaker_skip=True 透传", rec4["breaker_skip"], True)
+    check("缺键：ts 透传", rec4["ts"], "t")
+
+    chat_text = "最近一句聊天"
+    rec5 = build_decision_record(
+        {"suppress": True, "reason": "", "choice": "no_reply", "confidence": 0.90,
+         "p_no_reply": 0.95, "chat_text": chat_text},
+        action="suppress", reused=False, breaker_skip=False, timestamp="t")
+    check("记录不含聊天正文（json.dumps 全串断言）",
+          chat_text not in json.dumps(rec5, ensure_ascii=False), True)
+
+
 if __name__ == "__main__":
     test_extract()
     test_mention_window()
@@ -282,5 +340,6 @@ if __name__ == "__main__":
     test_adapters()
     test_allowlist()
     test_dedup_breaker()
+    test_decision_record()
     print("\n通过 %d / 失败 %d" % (PASS, FAIL))
     sys.exit(1 if FAIL else 0)

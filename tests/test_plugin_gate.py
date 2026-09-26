@@ -410,6 +410,54 @@ def test_e2e():
         shutil.rmtree(data_dir, ignore_errors=True)
 
 
+def test_config_get():
+    print("\n[8] ctx.config.get 现代写法（todo 9）")
+    data_dir = tempfile.mkdtemp(prefix="jev_gate_cfgget_")
+    try:
+        # ---- 8a. 非空昵称：无手填别名 → _resolve_aliases 走 config.get ----
+        inst, ctx = _build_instance(data_dir)
+        inst.config = _plugin_mod.GateSettings(
+            plugin={"enabled": True, "api_key": "test-key",
+                    "endpoint": "https://example.invalid/v1/systemone"},
+            gate={"bot_aliases": []},
+        )
+        aliases, source = asyncio.run(inst._resolve_aliases([]))
+        check("config.get 非空 → (['小助手'], '自动读主程序配置 bot.nickname')",
+              (aliases, source), (["小助手"], "自动读主程序配置 bot.nickname"))
+
+        # ---- 8b. 空昵称：config.get 返回 "" → 拒绝启用 ----
+        class EmptyConfig:
+            async def get(self, key, default=None):
+                return "" if key == "bot.nickname" else default
+
+        inst2, ctx2 = _build_instance(data_dir)
+        inst2.config = _plugin_mod.GateSettings(
+            plugin={"enabled": True, "api_key": "test-key",
+                    "endpoint": "https://example.invalid/v1/systemone"},
+            gate={"bot_aliases": []},
+        )
+        inst2.ctx.config = EmptyConfig()
+        aliases2, source2 = asyncio.run(inst2._resolve_aliases([]))
+        check("config.get 空 → ([], '未获取到')", (aliases2, source2), ([], "未获取到"))
+
+        # 门控必须拒绝启用：_maybe_gate 返回纯 continue，_ask_choice 调用 0 次
+        # （_alias_refresh_ts 拨到过去，逼 _aliases_for_gate 真正走 _resolve_aliases）
+        inst2._alias_refresh_ts = -1000.0
+        calls = []
+
+        async def fake_ask(text, cfg, aliases):
+            calls.append(text)
+            return "no_reply", 0.90, {"no_reply": 0.95}
+
+        inst2._ask_choice = fake_ask
+        kwargs = {"items": [CHAT_ITEM]}
+        out = asyncio.run(_run_maybe_gate(inst2, kwargs))
+        check("空昵称 → 门控拒绝启用：返回纯 continue", out, {"action": "continue"})
+        check("空昵称 → _ask_choice 调用 0 次", len(calls), 0)
+    finally:
+        shutil.rmtree(data_dir, ignore_errors=True)
+
+
 def test_log_dump():
     print("\n[7] 行为保持证据：日志元组 dump（供评审对照改动前文案）")
     data_dir = tempfile.mkdtemp(prefix="jev_gate_dump_")
@@ -447,6 +495,7 @@ if __name__ == "__main__":
         test_static()
         test_stale_state()
         test_e2e()
+        test_config_get()
         test_log_dump()
         print("\n通过 %d / 失败 %d" % (PASS, FAIL))
     finally:

@@ -129,16 +129,15 @@ class JevTimingGatePlugin(MaiBotPlugin):
         if configured:
             return configured, "插件配置手填"
         try:
-            result = await self.ctx.call_capability("config.get", key="bot.nickname", default="")
+            # `ctx.config.get` 是文档化的配置读取入口，直接返回配置值，
+            # 不需要再从 RPC 结果里取 `value` 字段
+            # （docs/zh/plugin/config.md:317-330、docs/zh/plugin/api-reference.md:258-290）。
+            # `config.get` 读的是**全局**配置项（docs/zh/develop/plugin-runtime-internals.md:243），
+            # 因此 `bot.nickname` 取的是主程序机器人昵称。
+            name = str(await self.ctx.config.get("bot.nickname", "") or "").strip()
         except Exception as exc:
             self.ctx.logger.debug("%s：config.get(bot.nickname) 调用失败: %s", LOG_TAG, exc)
             return [], "未获取到"
-        if isinstance(result, dict) and result.get("success"):
-            name = str(result.get("value") or "").strip()
-        elif isinstance(result, str):
-            name = result.strip()
-        else:
-            name = ""
         if name:
             return [name], "自动读主程序配置 bot.nickname"
         return [], "未获取到"

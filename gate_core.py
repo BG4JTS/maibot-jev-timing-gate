@@ -1,11 +1,17 @@
 """Jev 参与门控的纯逻辑层（不依赖 MaiBot SDK，可离线单测）。
 
-这些实现从 生产实现 的生产代码抽取，两边保持一致；
-改任何一边时记得同步另一边。三块内容：
+本文件自 v1.1.0 起由本仓库（BG4JTS/maibot-jev-timing-gate）**手写维护**；
+原始逻辑源自 krijingle-create 的 maibot-jev-timing-gate（从其生产实现中抽取）。
+改这里时直接改本仓库，不再依赖任何外部生成器。内容分块：
 
-1. planner 状态文本提取：只保留真实聊天内容，剔除人设/记忆/框架注入
+1. planner 状态文本提取：allowlist 优先（聊天消息 Item 整条保留），未标记 Item 回退排除清单
 2. @机器人 豁免：只看**最新消息**（state 尾部窗口），避免历史提及污染
 3. Jev Choice 原语：请求体构造与响应解析（含 confidence / probabilities 两把尺子）
+4. 抑制判定：把 Jev 响应归一成"是否抑制本轮"（probabilities 优先，缺则回退 confidence）
+5. 抑制时的极简替代请求：命中抑制后改写的低成本收尾 Item
+6. 多提供商适配：typesafe / classifier_dev / openai_json 的请求与响应归一
+7. 每轮去重：内容指纹 + 有界 LRU/TTL 缓存，时间由调用方注入
+8. 熔断器：连续失败达阈值进入冷却，冷却期内跳过判定直接放行
 """
 
 from __future__ import annotations

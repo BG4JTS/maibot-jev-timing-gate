@@ -777,15 +777,63 @@ def summarize_decision_records(records: Iterable[Any]) -> dict[str, Any]:
 #: ``docs/zh/plugin/home-cards.md`` 推荐的可用内容块类型（Host 会裁剪过长文本）。
 HOME_CARD_BLOCK_TYPES: tuple[str, ...] = ("markdown", "text", "stat", "key_value", "list", "actions")
 
+#: 宿主 token 趋势的展示口径。
+#: ``ctx.statistics.local.token_trend()`` 是**宿主级历史聚合**（``docs/zh/plugin/api-reference.md:664,668,681``），
+#: 没有 per-turn / per-plugin 归属，因此只作背景参考——**绝不**把它算作本插件的成效。
+HOST_TOKEN_TREND_CAPTION_TEMPLATE = (
+    "宿主 token 趋势（近 {days} 天，宿主级历史聚合，**无**本插件归属，仅作背景参考）"
+)
+
+
+def format_token_trend(series: Any, *, days: int = 7) -> str:
+    """把宿主 ``token_trend()`` 的 ``series`` 压成一行可读文本（纯函数，不读盘）。
+
+    优先用 ``series["total"]``（映射则逐项列出，标量则直接给值）；没有 ``total`` 时
+    回落到对 ``values_by_key`` 各序列求和。结构不符或无数据时返回空串，调用方据此
+    不展示这一块（而不是显示一个会误导人的 0）。
+    """
+
+    if not isinstance(series, Mapping):
+        return ""
+    total = series.get("total")
+    total_text = ""
+    if isinstance(total, Mapping):
+        total_text = "、".join(
+            "%s %s" % (key, value) for key, value in total.items()
+            if isinstance(value, (int, float)) and not isinstance(value, bool)
+        )
+    elif isinstance(total, (int, float)) and not isinstance(total, bool):
+        total_text = "%d" % total
+    if not total_text:
+        values = series.get("values_by_key")
+        if isinstance(values, Mapping):
+            sums = []
+            for key, seq in values.items():
+                if isinstance(seq, (list, tuple)):
+                    subtotal = sum(v for v in seq if isinstance(v, (int, float)) and not isinstance(v, bool))
+                    sums.append("%s %d" % (key, subtotal))
+            total_text = "、".join(sums)
+    if not total_text:
+        return ""
+    source_count = series.get("source_count")
+    tail = ""
+    if isinstance(source_count, (int, float)) and not isinstance(source_count, bool):
+        tail = "（数据源 %d）" % source_count
+    return "近 %d 天：%s%s" % (int(days), total_text, tail)
+
 
 def build_home_card_blocks(summary: Mapping[str, Any], *, breaker_open: bool,
                            cooldown_remaining: float = 0.0, breaker_hits: int = 0,
-                           probability_threshold: float = 0.80) -> list[dict[str, Any]]:
+                           probability_threshold: float = 0.80,
+                           token_trend_text: str = "", token_trend_days: int = 7) -> list[dict[str, Any]]:
     """构造首页卡片内容块（纯函数，不做任何 I/O）。
 
     只使用文档推荐的 ``markdown`` / ``stat`` / ``key_value`` 内容块，**不产生**
     HTML/JS（``docs/zh/plugin/home-cards.md:85``：WebUI 不执行插件提供的 HTML/JS）。
     数值全部来自本地判定记录，**不含聊天正文**。
+
+    ``token_trend_text`` 非空时追加一块宿主 token 趋势作为**背景参考**：它是宿主级
+    历史聚合、无本插件归属，展示文案里已明确这一点，因此不构成对本插件成效的归因。
     """
 
     total = int(summary.get("total") or 0)
@@ -820,4 +868,10 @@ def build_home_card_blocks(summary: Mapping[str, Any], *, breaker_open: bool,
     ]
     if shadow_only:
         blocks.append({"type": "markdown", "content": "影子模式：另有 %d 轮「本该抑制」未改行为。" % shadow_only})
+    if token_trend_text:
+        blocks.append({
+            "type": "markdown",
+            "content": HOST_TOKEN_TREND_CAPTION_TEMPLATE.format(days=int(token_trend_days)),
+        })
+        blocks.append({"type": "text", "content": str(token_trend_text)})
     return blocks

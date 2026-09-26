@@ -1,7 +1,8 @@
 """Jev 参与门控（timing gate）。
 
 在 `maisaka.planner.before_request` 之前做一次**廉价判断**：用决策模型 Jev 判
-「本轮是否值得进入完整 planner」，高置信判「无需参与」时抑制这一轮，省下一次 planner 调用。
+「本轮是否值得进入完整 planner」，高置信判「无需参与」时把这一轮的 items 改写成一条极简请求
+（不带选中的历史消息与工具定义）。开销与收益量级接近，实际效果取决于你所在群的噪声占比。
 
 **开箱即用**：装好后只需要填两个东西——Jev 的 `endpoint` 与 `api_key`。
 机器人昵称（@豁免用）通过官方 `config.get` 能力读主程序的 `bot.nickname`；读不到时在
@@ -43,6 +44,7 @@ DEDUP_CAPACITY = 256          # 去重缓存容量（有界 LRU）
 DEDUP_TTL_SECONDS = 120.0     # 同一内容指纹在此秒数内视为同一轮
 BREAKER_THRESHOLD = 5         # 连续失败达到此值 → 打开熔断
 BREAKER_COOLDOWN_SECONDS = 300.0  # 熔断打开后的冷却秒数
+HOST_TOKEN_TREND_DAYS = 7     # 首页卡片上宿主 token 趋势的展示窗口（天）
 DECISION_RECORD_FILE = "gate_decisions.jsonl"  # 判定记录（JSONL：只记判断结果，不含聊天正文）
 
 #: 首页卡片的注册期兜底内容。
@@ -433,6 +435,23 @@ class JevTimingGatePlugin(MaiBotPlugin):
         except Exception:
             return ""
 
+    async def _host_token_trend_text(self) -> str:
+        """读宿主 token 趋势并压成一行背景说明；任何失败都返回空串（卡片不展示该块）。
+
+        `ctx.statistics.local.token_trend()` 是**宿主级历史聚合**
+        （docs/zh/plugin/api-reference.md:664,668,681）：它没有 per-turn / per-plugin
+        归属，无法归因到本插件，所以这里只作背景参考，**绝不**把它算作本插件的成效。
+        未在 `capabilities` 声明该能力时宿主会拒绝调用——捕获后静默降级。
+        """
+
+        try:
+            series = await self.ctx.statistics.local.token_trend(days=HOST_TOKEN_TREND_DAYS)
+        except Exception as exc:
+            self.ctx.logger.debug(
+                "%s：读取宿主 token 趋势失败（已忽略，卡片不展示该块）: %s", LOG_TAG, exc)
+            return ""
+        return core.format_token_trend(series, days=HOST_TOKEN_TREND_DAYS)
+
     async def _home_card_blocks(self) -> list[dict[str, Any]]:
         """按本地判定记录聚合出首页卡片内容块；读盘走 to_thread，失败即降级为静态描述。"""
 
@@ -459,6 +478,8 @@ class JevTimingGatePlugin(MaiBotPlugin):
                 cooldown_remaining=remaining,
                 breaker_hits=int(summary.get("breaker_skip") or 0),
                 probability_threshold=threshold,
+                token_trend_text=await self._host_token_trend_text(),
+                token_trend_days=HOST_TOKEN_TREND_DAYS,
             )
         except Exception as exc:
             self.ctx.logger.warning("%s：首页卡片内容构造失败（已降级为静态描述）: %s", LOG_TAG, exc)

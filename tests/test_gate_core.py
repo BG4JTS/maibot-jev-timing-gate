@@ -16,6 +16,7 @@ from gate_core import (  # noqa: E402
     build_request,
     build_decision_record,
     build_home_card_blocks,
+    format_token_trend,
     HOME_CARD_BLOCK_TYPES,
     parse_decision_records,
     summarize_decision_records,
@@ -387,6 +388,31 @@ def test_records_and_card():
           ("0", "0%", "已打开", "冷却剩余 42 秒"))
     check("card：零记录无影子提示块",
           any("影子模式" in b.get("content", "") for b in blocks2), False)
+    check("card：无 token 趋势文本 → 不追加该块",
+          "宿主 token 趋势" in json.dumps(blocks2, ensure_ascii=False), False)
+
+    # ---- format_token_trend（宿主级聚合，仅背景参考） ----
+    check("trend：total 映射 → 逐项列出", format_token_trend(
+        {"total": {"token": 123456, "input": 100000, "output": 23456}, "source_count": 2}, days=7),
+        "近 7 天：token 123456、input 100000、output 23456（数据源 2）")
+    check("trend：total 标量 → 直接给值",
+          format_token_trend({"total": 42}), "近 7 天：42")
+    check("trend：无 total → values_by_key 求和",
+          format_token_trend({"values_by_key": {"token": [1, 2, 3], "input": [4, 5]}}),
+          "近 7 天：token 6、input 9")
+    check("trend：结构性无数据 → 空串", format_token_trend({"timestamps": []}), "")
+    check("trend：非映射 → 空串", format_token_trend(None), "")
+    check("trend：bool 不被当数字", format_token_trend({"total": True}), "")
+
+    blocks3 = build_home_card_blocks(summary, breaker_open=False, breaker_hits=1,
+                                     token_trend_text="近 7 天：token 123456（数据源 2）",
+                                     token_trend_days=7)
+    dump3 = json.dumps(blocks3, ensure_ascii=False)
+    check("card：有 token 趋势 → 出现背景说明块", "宿主 token 趋势" in dump3, True)
+    check("card：背景说明明示「无本插件归属」", "本插件归属" in dump3, True)
+    check("card：背景说明不含省下/节省类断言",
+          ("省下" not in dump3) and ("节省" not in dump3), True)
+    check("card：token 趋势数值被展示", "123456" in dump3, True)
 
 
 if __name__ == "__main__":

@@ -983,6 +983,41 @@ def test_home_card():
               (isinstance(blocks5, list)
                and all(b.get("type") in core.HOME_CARD_BLOCK_TYPES for b in blocks5)
                and stats5["累计判定"]["value"] == "0"), True)
+
+        # ---- 15f. 宿主 token 趋势：成功 → 背景块；被拒 → 不展示该块 ----
+        class _TrendStats:
+            class local:
+                calls = 0
+
+                @staticmethod
+                async def token_trend(days=7, **kwargs):
+                    _TrendStats.local.calls += 1
+                    return {"total": {"token": 123456, "input": 100000, "output": 23456},
+                            "source_count": 2}
+
+        inst_ok, _c2 = _build_instance(data_dir)
+        inst_ok.ctx.statistics = _TrendStats()
+        blocks6 = asyncio.run(inst_ok.home_card())
+        dump6 = json.dumps(blocks6, ensure_ascii=False)
+        check("卡片：token 趋势 → 出现背景说明块", "宿主 token 趋势" in dump6, True)
+        check("卡片：token 趋势 → 明示「无本插件归属」", "本插件归属" in dump6, True)
+        check("卡片：token 趋势 → 数值被展示", "123456" in dump6, True)
+        check("卡片：全卡无「省下/节省」类断言",
+              ("省下" not in dump6) and ("节省" not in dump6), True)
+        check("卡片：token_trend 恰好被调用 1 次", _TrendStats.local.calls, 1)
+
+        class _BoomStats:
+            class local:
+                @staticmethod
+                async def token_trend(days=7, **kwargs):
+                    raise PermissionError("capability statistics.local.token_trend not declared")
+
+        inst_rej, _c3 = _build_instance(data_dir)
+        inst_rej.ctx.statistics = _BoomStats()
+        blocks7 = asyncio.run(inst_rej.home_card())
+        check("卡片：statistics 被拒 → 不展示该块且不抛异常",
+              (isinstance(blocks7, list)
+               and "宿主 token 趋势" not in json.dumps(blocks7, ensure_ascii=False)), True)
     finally:
         shutil.rmtree(data_dir, ignore_errors=True)
 

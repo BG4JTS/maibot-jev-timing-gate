@@ -3,7 +3,7 @@
   "id": "bg4jts.jev-timing-gate",
   "version": "1.1.0",
   "name": "Jev 参与门控",
-  "description": "用决策模型 Jev 在 planner 请求前做一次廉价判断（带校准置信度的 Choice 原语），高置信判「本轮无需参与」时把这一轮改写成一条极简请求（不带历史消息与工具定义），省下一次完整 planner 调用。开箱即用：只需填端点与 key，机器人昵称通过官方 config.get 能力自动获取；支持 typesafe / classifier.dev / 任意 OpenAI 兼容网关三种接口风格；含 @机器人 确定性豁免与尾部窗口防历史提及污染；不读写宿主文件，不改宿主核心。",
+  "description": "用决策模型 Jev 在 planner 请求前做一次廉价判断（带校准置信度的 Choice 原语），高置信判「本轮无需参与」时把这一轮改写成一条极简请求（不带历史消息与工具定义），不再完整走一遍 planner。开箱即用：只需填端点与 key，机器人昵称通过官方 config.get 能力自动获取；支持 typesafe / classifier.dev / 任意 OpenAI 兼容网关三种接口风格；含 @机器人 确定性豁免与尾部窗口防历史提及污染；不读写宿主文件，不改宿主核心。",
   "author": {
     "name": "BG4JTS",
     "url": "https://github.com/BG4JTS"

@@ -21,6 +21,12 @@ from gate_core import (  # noqa: E402
     normalize_style,
     parse_response,
     resolve_auth,
+    _is_message_content,
+    BreakerState,
+    DedupCache,
+    breaker_record,
+    breaker_should_skip,
+    turn_fingerprint,
 )
 
 PASS = FAIL = 0
@@ -188,10 +194,83 @@ def test_adapters():
     check("openai_json 垃圾输出 → None",
           parse_response("openai_json", {"choices": [{"message": {"content": "我不知道"}}]}), (None, None, {}))
 
-    # 归一后接判定：classifier_dev 无 probabilities → 走 confidence 回退阈值
+    # 归一后接判定：payload_cd_no 带 scores → probabilities["no_reply"] = 0.93（≥ 0.80），
+    # 走 p_no_reply 主路径（evidence == "p_no_reply"），并非 confidence 回退。
     d = evaluate_decision(*parse_response("classifier_dev", payload_cd_no),
                           probability_threshold=0.80, confidence_fallback_threshold=0.62)
     check("classifier_dev 走回退阈值判定", (d["suppress"], d["evidence"]), (True, "p_no_reply"))
+
+
+# ---------------------------------------------------------------- 7. allowlist 提取（todo 1）
+def test_allowlist():
+    print("\n[7] allowlist 优先提取（todo 1）")
+    check("_is_message_content: <message 标签 → True",
+          _is_message_content('<message user="甲">'), True)
+    check("_is_message_content: 普通文本 → False",
+          _is_message_content("普通聊天"), False)
+
+    item_a = [{"item_type": "UserMessageItem", "parts": [
+        {"type": "text", "text": '<message user="甲">\n'},
+        {"type": "text", "text": "【人物画像-内部参考】"},
+    ]}]
+    state_a = extract_planner_state_text(item_a)
+    check("含 <message> 的 Item 整条保留（含框架标记 part）",
+          "<message" in state_a and "人物画像" in state_a, True)
+
+    check("无 <message> 纯文本 → 回退仍提取",
+          extract_planner_state_text([{"item_type": "UserMessageItem",
+                                       "parts": [{"type": "text", "text": "最近一句聊天"}]}]),
+          "最近一句聊天")
+
+    check("纯框架文本（人物画像 + 时间）→ 空串",
+          extract_planner_state_text([
+              {"item_type": "UserMessageItem",
+               "parts": [{"type": "text", "text": "【人物画像-内部参考】"}]},
+              {"item_type": "UserMessageItem",
+               "parts": [{"type": "text", "text": "时间：2026-09-22 10:00:00"}]},
+          ]), "")
+
+    both_items = [{"item_type": "UserMessageItem", "parts": [
+        {"type": "text", "text": '<message user="甲">\n'},
+        {"type": "text", "text": "你好"},
+    ]},
+        {"item_type": "UserMessageItem", "parts": [{"type": "text", "text": "最近一句聊天"}]}]
+    state_both = extract_planner_state_text(both_items)
+    check("标记 Item + 未标记 Item 都保留（test:53 不变量）",
+          "你好" in state_both and "最近一句聊天" in state_both, True)
+
+
+# ---------------------------------------------------------------- 8. 去重与熔断（todo 2/3）
+def test_dedup_breaker():
+    print("\n[8] 去重（DedupCache / turn_fingerprint）与熔断器（todo 2/3）")
+    cache = DedupCache(capacity=8, ttl_seconds=100.0)
+    cache.put("k", "v", 0.0)
+    check("TTL 内命中", cache.get("k", 99.0), "v")
+    check("TTL 边界（now >= expires_at）→ 过期", cache.get("k", 100.0), None)
+
+    evict = DedupCache(capacity=8, ttl_seconds=100.0)
+    for i in range(9):
+        evict.put("k%d" % i, "v%d" % i, 0.0)
+    check("9 键超容量 8 → 最早键被淘汰", evict.get("k0", 0.0), None)
+    check("最新键仍在", evict.get("k8", 0.0), "v8")
+
+    check("hint 不同但内容相同 → 同一指纹（保守去重）",
+          turn_fingerprint("同一段内容", hint="a") == turn_fingerprint("同一段内容", hint="b"), True)
+
+    s = BreakerState()
+    for i in range(5):
+        breaker_record(s, False, float(i))
+    check("5 次连续失败 → 熔断打开", breaker_should_skip(s, 5.0), True)
+    check("冷却期内 → 跳过", breaker_should_skip(s, 100.0), True)
+    check("冷却到期 → 关闭并放行", breaker_should_skip(s, 305.0), False)
+    check("关闭后 opened_at 复位", s.opened_at, None)
+
+    s2 = BreakerState()
+    for i in range(4):
+        breaker_record(s2, False, float(i))
+    breaker_record(s2, True, 4.0)
+    breaker_record(s2, False, 5.0)
+    check("4 失败 + 1 成功 + 1 失败 → 不打开", breaker_should_skip(s2, 6.0), False)
 
 
 if __name__ == "__main__":
@@ -201,5 +280,7 @@ if __name__ == "__main__":
     test_decision()
     test_skip_item()
     test_adapters()
+    test_allowlist()
+    test_dedup_breaker()
     print("\n通过 %d / 失败 %d" % (PASS, FAIL))
     sys.exit(1 if FAIL else 0)

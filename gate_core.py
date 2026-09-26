@@ -15,6 +15,7 @@ import json
 import re
 import uuid
 from collections import OrderedDict
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Iterable, Mapping
 
@@ -550,3 +551,51 @@ class DedupCache:
 
     def __len__(self) -> int:
         return len(self._store)
+
+
+# ---------------------------------------------------------------------------
+# 8. 熔断器（纯函数；时间一律由调用方注入）
+# ---------------------------------------------------------------------------
+
+@dataclass
+class BreakerState:
+    """端点连续失败后的冷却状态（纯数据，时间由调用方注入）。
+
+    为什么需要熔断：``timeout_sec = 6.0`` 而 hook 超时上限是 ``HOOK_TIMEOUT_MS = 8000``，
+    且 hook 延迟是**直接叠加**的（``docs/zh/develop/event-pipeline-hooks.md:233``）——
+    一个病态端点会在每一轮被跳过的判定上都叠 ~6 秒的挂钩延迟。因此连续 5 次失败
+    打开一个 300 秒的冷却阀是刻意的安全阀：冷却期内跳过判定、直接放行，不再发起网络请求。
+
+    注意：``last_error`` 只用于人可读的诊断，**绝不能携带 API key**。
+    """
+
+    failure_count: int = 0
+    opened_at: float | None = None
+    threshold: int = 5
+    cooldown_seconds: float = 300.0
+    last_error: str = ""
+
+
+def breaker_should_skip(state: BreakerState, now: float) -> bool:
+    """熔断打开且冷却未到期 → 跳过判定；冷却到期 → 关闭熔断并放行。"""
+
+    if state.opened_at is None:
+        return False
+    if now < state.opened_at + state.cooldown_seconds:
+        return True
+    state.opened_at = None
+    state.failure_count = 0
+    return False
+
+
+def breaker_record(state: BreakerState, ok: bool, now: float) -> None:
+    """记录一次判定结果：成功 → 计数归零并关闭；失败 → 计数 +1，达阈值打开熔断。"""
+
+    if ok:
+        state.failure_count = 0
+        state.opened_at = None
+        state.last_error = ""
+        return
+    state.failure_count += 1
+    if state.failure_count >= state.threshold and state.opened_at is None:
+        state.opened_at = now

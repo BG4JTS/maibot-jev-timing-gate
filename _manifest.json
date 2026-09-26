@@ -32,7 +32,8 @@
     }
   },
   "capabilities": [
-    "config.get"
+    "config.get",
+    "statistics.local.token_trend"
   ],
   "i18n": {
     "default_locale": "zh-CN"

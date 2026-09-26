@@ -32,15 +32,15 @@ Jev 提供 Choice / Score / Noul 三种原语，返回带校准置信度的结�
 
 ## 二、安装（开箱即用：只需要填两个字段）
 
-先把插件放进 `MaiBot/plugins/`，目录名用 `local_jev-timing-gate`（与 manifest 的 id 对应）。
+先把插件放进 `MaiBot/plugins/`，目录名用 `bg4jts_jev-timing-gate`（与 manifest 的 id `bg4jts.jev-timing-gate` 对应）。
 在 MaiBot 根目录下执行：
 
 ```bash
 # git clone：之后可以直接 git pull 更新
-git clone https://github.com/krijingle-create/maibot-jev-timing-gate.git plugins/local_jev-timing-gate
+git clone https://github.com/BG4JTS/maibot-jev-timing-gate.git plugins/bg4jts_jev-timing-gate
 
 # 或者下载 ZIP：仓库页 Download ZIP，解压后把 maibot-jev-timing-gate-main
-# 改名成 local_jev-timing-gate，整个目录放进 plugins/
+# 改名成 bg4jts_jev-timing-gate，整个目录放进 plugins/
 ```
 
 目录名要写在 clone 命令末尾，直接 `git clone <地址>` 会建成 `maibot-jev-timing-gate`。
@@ -54,7 +54,7 @@ git clone https://github.com/krijingle-create/maibot-jev-timing-gate.git plugins
 ### 更新
 
 ```bash
-cd plugins/local_jev-timing-gate && git pull
+cd plugins/bg4jts_jev-timing-gate && git pull
 ```
 
 WebUI 插件页的更新按钮两条路径都认：目录里有 `.git` 就 `git pull`，没有就按 manifest 的仓库地址重新克隆一份。
@@ -146,5 +146,30 @@ Jev 只做判断，不生成文本，不能替 planner 或 replyer 写任何东�
 | `plugin.py` | 插件主体：hook 注册、Jev 调用、门控判定 |
 | `gate_core.py` | 纯逻辑（状态提取 / @豁免窗口 / 判定 / 多提供商适配），不依赖 SDK，可离线单测 |
 | `config.py` / `config.example.toml` | 配置模型（含设置页标签与下拉）与带注释的参考 |
-| `tests/test_gate_core.py` | 65 条离线用例（`python tests/test_gate_core.py`） |
+| `tests/test_gate_core.py` | 纯逻辑离线用例（`python tests/test_gate_core.py`） |
+| `tests/test_plugin_gate.py` | 插件接线离线集成用例：桩掉 SDK、不联网（`python tests/test_plugin_gate.py`） |
 | `LICENSE` | 许可证（MIT） |
+
+---
+
+## 五、来源与致谢
+
+本仓库是 **krijingle-create** 的 [`maibot-jev-timing-gate`](https://github.com/krijingle-create/maibot-jev-timing-gate)
+的衍生仓库（fork），由 **BG4JTS** 独立维护：
+
+- 上游仓库：<https://github.com/krijingle-create/maibot-jev-timing-gate>（原作者：krijingle-create）
+- 本仓库：<https://github.com/BG4JTS/maibot-jev-timing-gate>
+- 授权：MIT。`LICENSE` 保留上游版权行 `Copyright (c) 2026 krijingle-create`，并在其下追加本仓库的版权行。
+- 本仓库**永久独立、不跟踪上游**（不配置 `upstream` remote），因此 `gate_core.py` 与上游必然逐步分叉；
+  `gate_core.py` 自 v1.1.0 起由本仓库手写维护，不再是「由仓库外生成器产出的生成物」。
+
+相对上游的主要修改：
+
+1. `gate_core.py` 状态提取改为 **allowlist 优先**：聊天消息 Item 整条保留，未标记 Item 回退到排除清单。
+2. 新增**每轮去重**：同一内容指纹在时限内只判定一次，避免 `planner.before_request` 多次触发导致重复付费。
+3. 新增**熔断器**：端点连续失败达阈值后进入冷却，冷却期内不发起网络请求、直接放行。
+4. 密钥默认位置迁到宿主规范目录 `ctx.paths.data_dir`；旧的插件目录同名文件仍兼容读取并一次性告警。
+5. 配置读取改用文档化的 `ctx.config.get`；插件身份改为 `bg4jts.jev-timing-gate` / `1.1.0`。
+6. 新增**判定记录持久化**（JSONL，**不含聊天正文**）、WebUI **首页成效卡片**，以及宿主 token 趋势的背景展示。
+
+上游项目自己的发布流水线与本仓库无关；本仓库的维护说明见 `PUBLISHING.md`。

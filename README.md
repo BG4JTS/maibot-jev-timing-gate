@@ -86,7 +86,7 @@ api_style = "typesafe"   # typesafe / classifier_dev / openai_json（设置页�
 endpoint = ""            # 留空按模板取默认；openai_json 必填
 auth_header = ""         # 留空按模板取默认；"none" = 不发鉴权头
 auth_prefix = ""         # 留空按模板取默认；"none" = 不带前缀直传 key
-api_key = ""             # 填这里即可；也可放插件目录 jev_config.json（600 权限）隐藏密钥
+api_key = ""             # 填这里即可；也可放 data/plugins/<plugin_id>/jev_config.json（600 权限）隐藏密钥；旧插件目录同名文件仍兼容
 model = "jev-latest"     # 实测 jev-1.13.0 也可用；jev-fast / jev 会返回 400
 timeout_sec = 6.0        # 超时即放行；必须小于 hook 超时 8 秒
 state_max_chars = 3000   # 判定用的聊天文本上限（取最新内容）

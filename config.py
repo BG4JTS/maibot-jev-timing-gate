@@ -81,10 +81,12 @@ class PluginOptions(PluginConfigBase):
     api_key: str = Field(
         default="",
         description=(
-            "访问上面端点的 key。留空时会尝试读取插件目录下的 jev_config.json"
-            "（内容 {\"api_key\": \"...\"}），适合想把密钥从 WebUI 配置里藏起来的场景。"
+            "访问上面端点的 key。留空时会尝试读取宿主数据目录下的 jev_config.json"
+            "（内容 {\"api_key\": \"...\"}，默认位于 data/plugins/<plugin_id>/），"
+            "适合想把密钥从 WebUI 配置里藏起来的场景；"
+            "旧版放在插件源码目录的同名文件仍兼容读取，命中时会一次性提醒迁移。"
         ),
-        json_schema_extra={"label": "API Key", "hint": "也可放插件目录 jev_config.json（600 权限）"},
+        json_schema_extra={"label": "API Key", "hint": "也可放 data/plugins/<plugin_id>/jev_config.json（600 权限）"},
     )
     model: str = Field(
         default="jev-latest",
